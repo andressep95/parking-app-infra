@@ -1,0 +1,147 @@
+name: "Terraform Plan"
+
+on:
+  pull_request:
+    branches:
+      - develop   # feature/* → develop triggers dev plan
+      - main      # develop → main triggers prod plan
+    paths:
+      - 'infrastructure/environments/**'
+      - 'infrastructure/modules/**'
+      - '.github/workflows/terraform-plan.yml'
+
+permissions:
+  id-token: write
+  contents: read
+  pull-requests: write
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION }}
+  TF_VERSION: 1.10.0
+
+jobs:
+  detect-changes:
+    name: "Detect Changed Environments"
+    runs-on: ubuntu-latest
+    outputs:
+      environments: ${{ steps.detect.outputs.environments }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Detect target environment
+        id: detect
+        run: |
+          TARGET_BRANCH="${{ github.base_ref }}"
+          ENVIRONMENTS=()
+
+          if [ "$TARGET_BRANCH" = "develop" ]; then
+            [ -d "infrastructure/environments/dev" ] && ENVIRONMENTS+=("dev")
+          elif [ "$TARGET_BRANCH" = "main" ]; then
+            [ -d "infrastructure/environments/prod" ] && ENVIRONMENTS+=("prod")
+          fi
+
+          if [ ${#ENVIRONMENTS[@]} -eq 0 ]; then
+            ENVIRONMENTS_JSON="[]"
+          else
+            ENVIRONMENTS_JSON=$(printf '%s\n' "${ENVIRONMENTS[@]}" | jq -R . | jq -s -c .)
+          fi
+          echo "environments=${ENVIRONMENTS_JSON}" >> $GITHUB_OUTPUT
+          echo "Target branch: ${TARGET_BRANCH} → environments: ${ENVIRONMENTS_JSON}"
+
+  terraform-plan:
+    name: "Plan - ${{ matrix.environment }}"
+    runs-on: ubuntu-latest
+    needs: detect-changes
+    if: needs.detect-changes.outputs.environments != '[]'
+    strategy:
+      matrix:
+        environment: ${{ fromJson(needs.detect-changes.outputs.environments) }}
+      fail-fast: false
+
+    defaults:
+      run:
+        working-directory: infrastructure/environments/${{ matrix.environment }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: github-actions-terraform-plan
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Terraform Format Check
+        id: fmt
+        run: terraform fmt -check -recursive
+        continue-on-error: true
+
+      - name: Terraform Init
+        id: init
+        run: |
+          terraform init -input=false \
+            -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}" \
+            -backend-config="key=${{ vars.PROJECT_NAME }}/${{ matrix.environment }}/terraform.tfstate" \
+            -backend-config="region=${{ vars.AWS_REGION }}"
+
+      - name: Terraform Validate
+        id: validate
+        run: terraform validate -no-color
+
+      - name: Terraform Plan
+        id: plan
+        run: |
+          terraform plan -no-color -input=false -out=tfplan \
+            -var="project_name=${{ vars.PROJECT_NAME }}" \
+            -var="aws_region=${{ vars.AWS_REGION }}" \
+            2>&1 | tee plan_output.txt
+          echo "stdout<<EOF" >> $GITHUB_OUTPUT
+          cat plan_output.txt >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+        continue-on-error: true
+
+      - name: Comment PR with Plan
+        uses: actions/github-script@v7
+        if: github.event_name == 'pull_request'
+        env:
+          PLAN: "${{ steps.plan.outputs.stdout }}"
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const output = `#### Terraform Plan - \`${{ matrix.environment }}\` 🌍
+
+            #### Terraform Format and Style 🖌\`${{ steps.fmt.outcome }}\`
+            #### Terraform Initialization ⚙️\`${{ steps.init.outcome }}\`
+            #### Terraform Validation 🤖\`${{ steps.validate.outcome }}\`
+            #### Terraform Plan 📖\`${{ steps.plan.outcome }}\`
+
+            <details><summary>Show Plan</summary>
+
+            \`\`\`terraform
+            ${process.env.PLAN}
+            \`\`\`
+
+            </details>
+
+            *Pusher: @${{ github.actor }}, Action: \`${{ github.event_name }}\`, Workflow: \`${{ github.workflow }}\`*`;
+
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: output
+            })
+
+      - name: Terraform Plan Status
+        if: steps.plan.outcome == 'failure'
+        run: exit 1

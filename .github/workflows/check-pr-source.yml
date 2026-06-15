@@ -1,0 +1,19 @@
+name: Check PR Source Branch
+
+on:
+  pull_request:
+    branches: [main]
+
+jobs:
+  check-pr-source:
+    name: Only PRs from develop are allowed
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate source branch
+        run: |
+          if [ "${{ github.head_ref }}" != "develop" ]; then
+            echo "❌ PRs to 'main' are only allowed from 'develop'."
+            echo "   Source branch: ${{ github.head_ref }}"
+            exit 1
+          fi
+          echo "✅ Source branch is 'develop'"

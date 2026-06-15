@@ -1,0 +1,134 @@
+name: "Terraform Apply"
+
+on:
+  push:
+    branches:
+      - develop   # merge to develop → apply dev
+      - main      # merge to main → apply prod
+    paths:
+      - 'infrastructure/environments/**'
+      - 'infrastructure/modules/**'
+
+permissions:
+  id-token: write
+  contents: write
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION }}
+  TF_VERSION: 1.10.0
+
+jobs:
+  detect-changes:
+    name: "Detect Changed Environments"
+    runs-on: ubuntu-latest
+    outputs:
+      environments: ${{ steps.detect.outputs.environments }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Detect target environment
+        id: detect
+        run: |
+          TARGET_BRANCH="${{ github.ref_name }}"
+          ENVIRONMENTS=()
+
+          if [ "$TARGET_BRANCH" = "develop" ]; then
+            [ -d "infrastructure/environments/dev" ] && ENVIRONMENTS+=("dev")
+          elif [ "$TARGET_BRANCH" = "main" ]; then
+            [ -d "infrastructure/environments/prod" ] && ENVIRONMENTS+=("prod")
+          fi
+
+          if [ ${#ENVIRONMENTS[@]} -eq 0 ]; then
+            ENVIRONMENTS_JSON="[]"
+          else
+            ENVIRONMENTS_JSON=$(printf '%s\n' "${ENVIRONMENTS[@]}" | jq -R . | jq -s -c .)
+          fi
+          echo "environments=${ENVIRONMENTS_JSON}" >> $GITHUB_OUTPUT
+          echo "Target branch: ${TARGET_BRANCH} → environments: ${ENVIRONMENTS_JSON}"
+
+  terraform-apply:
+    name: "Apply - ${{ matrix.environment }}"
+    runs-on: ubuntu-latest
+    needs: detect-changes
+    if: needs.detect-changes.outputs.environments != '[]'
+    environment: ${{ matrix.environment }}
+    strategy:
+      matrix:
+        environment: ${{ fromJson(needs.detect-changes.outputs.environments) }}
+      max-parallel: 1
+      fail-fast: true
+
+    defaults:
+      run:
+        working-directory: infrastructure/environments/${{ matrix.environment }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: github-actions-terraform-apply
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Terraform Init
+        id: init
+        run: |
+          terraform init \
+            -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}" \
+            -backend-config="key=${{ vars.PROJECT_NAME }}/${{ matrix.environment }}/terraform.tfstate" \
+            -backend-config="region=${{ vars.AWS_REGION }}"
+
+      - name: Terraform Plan
+        id: plan
+        run: |
+          terraform plan -no-color -input=false -out=tfplan \
+            -var="project_name=${{ vars.PROJECT_NAME }}" \
+            -var="aws_region=${{ vars.AWS_REGION }}"
+
+      - name: Terraform Apply
+        id: apply
+        run: terraform apply -auto-approve tfplan
+
+      - name: Terraform Output
+        id: output
+        run: terraform output -json > outputs.json && cat outputs.json
+        continue-on-error: true
+
+      - name: Comment on commit with outputs
+        uses: actions/github-script@v7
+        env:
+          OUTPUTS: "${{ steps.output.outputs.stdout }}"
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const output = `#### Terraform Apply - \`${{ matrix.environment }}\` ✅
+
+            **Status:** Successfully applied
+
+            <details><summary>Show Outputs</summary>
+
+            \`\`\`json
+            ${process.env.OUTPUTS}
+            \`\`\`
+
+            </details>
+
+            *Commit: \`${{ github.sha }}\`, Actor: @${{ github.actor }}*`;
+
+            github.rest.repos.createCommitComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              commit_sha: context.sha,
+              body: output
+            })
