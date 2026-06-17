@@ -108,12 +108,33 @@ resource "aws_cognito_user_pool_client" "this" {
 }
 
 # ============================================
-# Default User Group: "Public"
+# Grupos de roles (precedence menor = mayor prioridad en el token)
 # ============================================
+
+resource "aws_cognito_user_group" "admin" {
+  name         = "ADMIN"
+  user_pool_id = aws_cognito_user_pool.this.id
+  description  = "Equipo Haulmer — acceso total a todos los customers y locations"
+  precedence   = 0
+}
+
+resource "aws_cognito_user_group" "customer" {
+  name         = "CUSTOMER"
+  user_pool_id = aws_cognito_user_pool.this.id
+  description  = "Empresa cliente — gestiona sus propias locations y operadores"
+  precedence   = 10
+}
+
+resource "aws_cognito_user_group" "customer_operator" {
+  name         = "CUSTOMER_OPERATOR"
+  user_pool_id = aws_cognito_user_pool.this.id
+  description  = "Cajero/operador — opera el terminal en una location asignada"
+  precedence   = 20
+}
 
 resource "aws_cognito_user_group" "public" {
   name         = "Public"
   user_pool_id = aws_cognito_user_pool.this.id
-  description  = "Default group for all registered users"
+  description  = "Grupo por defecto para usuarios sin rol asignado"
   precedence   = 100
 }

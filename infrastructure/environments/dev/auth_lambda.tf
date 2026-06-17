@@ -17,6 +17,7 @@ module "auth_handler" {
   environment_variables = {
     COGNITO_USER_POOL_ID = module.cognito.user_pool_id
     COGNITO_CLIENT_ID    = module.cognito.client_id
+    DYNAMODB_TABLE_NAME  = module.main_table.table_name
   }
 
   log_retention_days = 30
@@ -62,8 +63,31 @@ resource "aws_iam_role_policy" "auth_handler_cognito" {
         "cognito-idp:InitiateAuth",
         "cognito-idp:AdminCreateUser",
         "cognito-idp:AdminSetUserPassword",
+        "cognito-idp:AdminAddUserToGroup",
+        "cognito-idp:AdminGetUser",
       ]
       Resource = module.cognito.user_pool_arn
+    }]
+  })
+}
+
+resource "aws_iam_role_policy" "auth_handler_dynamodb" {
+  name = "${var.environment}-${var.project_name}-auth-handler-dynamodb"
+  role = aws_iam_role.auth_handler.name
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect = "Allow"
+      Action = [
+        "dynamodb:PutItem",
+        "dynamodb:GetItem",
+        "dynamodb:Query",
+      ]
+      Resource = [
+        module.main_table.table_arn,
+        "${module.main_table.table_arn}/index/*",
+      ]
     }]
   })
 }

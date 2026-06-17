@@ -10,8 +10,39 @@ module "api_gateway" {
   lambda_invoke_arn = module.auth_handler.invoke_arn
 
   routes = {
+    # ── auth-handler (público) ────────────────────────────────────────────────
     "POST /api/v1/auth/login"    = { public = true }
     "POST /api/v1/auth/register" = { public = true }
+
+    # ── user-handler (JWT requerido) ──────────────────────────────────────────
+    "GET /api/v1/users" = {
+      lambda_invoke_arn = module.user_handler.invoke_arn
+      lambda_name       = module.user_handler.function_name
+    }
+    "GET /api/v1/users/{id}" = {
+      lambda_invoke_arn = module.user_handler.invoke_arn
+      lambda_name       = module.user_handler.function_name
+    }
+    "PUT /api/v1/users/{id}" = {
+      lambda_invoke_arn = module.user_handler.invoke_arn
+      lambda_name       = module.user_handler.function_name
+    }
+    "POST /api/v1/users/{id}/activate" = {
+      lambda_invoke_arn = module.user_handler.invoke_arn
+      lambda_name       = module.user_handler.function_name
+    }
+    "POST /api/v1/users/{id}/deactivate" = {
+      lambda_invoke_arn = module.user_handler.invoke_arn
+      lambda_name       = module.user_handler.function_name
+    }
+    "POST /api/v1/users/{id}/reset-password" = {
+      lambda_invoke_arn = module.user_handler.invoke_arn
+      lambda_name       = module.user_handler.function_name
+    }
+    "DELETE /api/v1/users/{id}" = {
+      lambda_invoke_arn = module.user_handler.invoke_arn
+      lambda_name       = module.user_handler.function_name
+    }
   }
 
   throttling_burst_limit = 50

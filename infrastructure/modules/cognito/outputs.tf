@@ -23,7 +23,22 @@ output "issuer_url" {
   value       = "https://${aws_cognito_user_pool.this.endpoint}"
 }
 
+output "group_admin" {
+  description = "Nombre del grupo ADMIN"
+  value       = aws_cognito_user_group.admin.name
+}
+
+output "group_customer" {
+  description = "Nombre del grupo CUSTOMER"
+  value       = aws_cognito_user_group.customer.name
+}
+
+output "group_customer_operator" {
+  description = "Nombre del grupo CUSTOMER_OPERATOR"
+  value       = aws_cognito_user_group.customer_operator.name
+}
+
 output "public_group_name" {
-  description = "Name of the default public user group"
+  description = "Nombre del grupo público por defecto"
   value       = aws_cognito_user_group.public.name
 }
