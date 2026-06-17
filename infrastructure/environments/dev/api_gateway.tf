@@ -43,6 +43,32 @@ module "api_gateway" {
       lambda_invoke_arn = module.user_handler.invoke_arn
       lambda_name       = module.user_handler.function_name
     }
+
+    # ── organization-handler (JWT requerido) ─────────────────────────────────
+    "GET /api/v1/organizations" = {
+      lambda_invoke_arn = module.organization_handler.invoke_arn
+      lambda_name       = module.organization_handler.function_name
+    }
+    "GET /api/v1/organizations/{id}" = {
+      lambda_invoke_arn = module.organization_handler.invoke_arn
+      lambda_name       = module.organization_handler.function_name
+    }
+    "PUT /api/v1/organizations/{id}" = {
+      lambda_invoke_arn = module.organization_handler.invoke_arn
+      lambda_name       = module.organization_handler.function_name
+    }
+    "POST /api/v1/organizations/{id}/activate" = {
+      lambda_invoke_arn = module.organization_handler.invoke_arn
+      lambda_name       = module.organization_handler.function_name
+    }
+    "POST /api/v1/organizations/{id}/deactivate" = {
+      lambda_invoke_arn = module.organization_handler.invoke_arn
+      lambda_name       = module.organization_handler.function_name
+    }
+    "DELETE /api/v1/organizations/{id}" = {
+      lambda_invoke_arn = module.organization_handler.invoke_arn
+      lambda_name       = module.organization_handler.function_name
+    }
   }
 
   throttling_burst_limit = 50
