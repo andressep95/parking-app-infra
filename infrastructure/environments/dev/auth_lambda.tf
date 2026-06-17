@@ -65,6 +65,9 @@ resource "aws_iam_role_policy" "auth_handler_cognito" {
         "cognito-idp:AdminSetUserPassword",
         "cognito-idp:AdminAddUserToGroup",
         "cognito-idp:AdminGetUser",
+        "cognito-idp:AdminDeleteUser",
+        "cognito-idp:GlobalSignOut",
+        "cognito-idp:AdminUserGlobalSignOut",
       ]
       Resource = module.cognito.user_pool_arn
     }]
@@ -82,7 +85,9 @@ resource "aws_iam_role_policy" "auth_handler_dynamodb" {
       Action = [
         "dynamodb:PutItem",
         "dynamodb:GetItem",
+        "dynamodb:DeleteItem",
         "dynamodb:Query",
+        "dynamodb:TransactWriteItems",
       ]
       Resource = [
         module.main_table.table_arn,

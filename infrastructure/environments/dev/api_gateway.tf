@@ -14,6 +14,16 @@ module "api_gateway" {
     "POST /api/v1/auth/login"    = { public = true }
     "POST /api/v1/auth/register" = { public = true }
 
+    # ── auth-handler (JWT requerido) ─────────────────────────────────────────
+    "POST /api/v1/auth/logout" = {
+      lambda_invoke_arn = module.auth_handler.invoke_arn
+      lambda_name       = module.auth_handler.function_name
+    }
+    "DELETE /api/v1/auth/sessions/{user_id}" = {
+      lambda_invoke_arn = module.auth_handler.invoke_arn
+      lambda_name       = module.auth_handler.function_name
+    }
+
     # ── user-handler (JWT requerido) ──────────────────────────────────────────
     "GET /api/v1/users" = {
       lambda_invoke_arn = module.user_handler.invoke_arn
