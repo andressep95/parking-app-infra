@@ -28,6 +28,11 @@ output "user_handler_lambda_name" {
   value       = module.user_handler.function_name
 }
 
+output "organization_handler_lambda_name" {
+  description = "Nombre de la Lambda de gestión de organizaciones"
+  value       = module.organization_handler.function_name
+}
+
 output "dynamodb_table_name" {
   description = "Nombre de la tabla DynamoDB principal"
   value       = module.main_table.table_name
