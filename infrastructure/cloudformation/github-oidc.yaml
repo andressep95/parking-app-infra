@@ -1,0 +1,231 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Bootstrap stack — GitHub Actions OIDC Provider e IAM roles para parking-app.
+  Se despliega una vez manualmente antes de que los pipelines de CI/CD puedan correr.
+  Los workflows cfn-deploy.yml y cfn-validate.yml dependen del rol de este stack.
+  ADVERTENCIA: No eliminar este stack sin antes deshabilitar los pipelines de CI/CD.
+
+Parameters:
+  GitHubOwner:
+    Type: String
+    Default: andressep95
+    Description: Usuario u organización de GitHub dueño de los repositorios
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: GitHub
+        Parameters:
+          - GitHubOwner
+    ParameterLabels:
+      GitHubOwner:
+        default: "GitHub Owner (usuario u org)"
+
+Resources:
+
+  # ── OIDC Provider ─────────────────────────────────────────────────────────────
+  # Permite que GitHub Actions asuma roles IAM via Web Identity Federation.
+  # Solo puede existir un proveedor por URL por cuenta AWS.
+
+  GitHubOIDCProvider:
+    Type: AWS::IAM::OIDCProvider
+    Properties:
+      Url: https://token.actions.githubusercontent.com
+      ClientIdList:
+        - sts.amazonaws.com
+      # AWS valida los certificados de GitHub via su librería de CAs raíz.
+      # El thumbprint es requerido por la API pero no se usa para validación activa.
+      ThumbprintList:
+        - 6938fd4d98bab03faadb97b34396831e3780aea1
+        - 1c58a3a8518e8759bf075b76b750d4f2df264fcd
+
+  # ── Rol: parking-app-infra ────────────────────────────────────────────────────
+  # Usado por los pipelines cfn-validate.yml y cfn-deploy.yml en parking-app-infra.
+  # Permisos amplios para gestionar infraestructura CloudFormation (sin IAM global,
+  # Billing ni Organizations).
+
+  InfraRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: github-actions-parking-app
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !GetAtt GitHubOIDCProvider.Arn
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                "token.actions.githubusercontent.com:aud": sts.amazonaws.com
+              StringLike:
+                "token.actions.githubusercontent.com:sub": !Sub "repo:${GitHubOwner}/parking-app-infra:*"
+      Policies:
+        - PolicyName: infrastructure-services
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: ["cloudformation:*"]
+                Resource: "*"
+              - Effect: Allow
+                Action: ["ec2:*"]
+                Resource: "*"
+              - Effect: Allow
+                Action: ["rds:*"]
+                Resource: "*"
+              - Effect: Allow
+                Action: ["lambda:*"]
+                Resource: "*"
+              - Effect: Allow
+                Action: ["s3:*"]
+                Resource: "*"
+              - Effect: Allow
+                Action: ["cloudwatch:*", "logs:*"]
+                Resource: "*"
+              - Effect: Allow
+                Action: ["ecs:*", "eks:*", "ecr:*"]
+                Resource: "*"
+              - Effect: Allow
+                Action: ["elasticache:*"]
+                Resource: "*"
+              - Effect: Allow
+                Action: ["sns:*", "sqs:*"]
+                Resource: "*"
+              - Effect: Allow
+                Action: ["secretsmanager:*"]
+                Resource: "*"
+              - Effect: Allow
+                Action: ["ssm:*"]
+                Resource: "*"
+              - Effect: Allow
+                Action: ["route53:*"]
+                Resource: "*"
+              - Effect: Allow
+                Action: ["acm:*"]
+                Resource: "*"
+              - Effect: Allow
+                Action: ["cloudfront:*"]
+                Resource: "*"
+              - Effect: Allow
+                Action: ["dynamodb:*"]
+                Resource: "*"
+              - Effect: Allow
+                Action: ["apigateway:*"]
+                Resource: "*"
+              - Effect: Allow
+                Action: ["elasticloadbalancing:*"]
+                Resource: "*"
+              - Effect: Allow
+                Action: ["autoscaling:*"]
+                Resource: "*"
+              - Effect: Allow
+                Action: ["events:*"]
+                Resource: "*"
+              - Effect: Allow
+                Action: ["states:*"]
+                Resource: "*"
+              - Effect: Allow
+                Action: ["kinesis:*", "firehose:*"]
+                Resource: "*"
+              - Effect: Allow
+                Action: ["cognito-idp:*", "cognito-identity:*"]
+                Resource: "*"
+              - Effect: Allow
+                Action: ["es:*"]
+                Resource: "*"
+              - Effect: Allow
+                Action: ["backup:*"]
+                Resource: "*"
+              - Effect: Allow
+                Action: ["kms:*"]
+                Resource: "*"
+              # IAM: solo lectura global + operaciones de roles con prefijo parking-app-*
+              - Effect: Allow
+                Action: ["iam:Get*", "iam:List*", "iam:PassRole"]
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - iam:CreateRole
+                  - iam:DeleteRole
+                  - iam:AttachRolePolicy
+                  - iam:DetachRolePolicy
+                  - iam:PutRolePolicy
+                  - iam:DeleteRolePolicy
+                  - iam:CreateInstanceProfile
+                  - iam:DeleteInstanceProfile
+                  - iam:AddRoleToInstanceProfile
+                  - iam:RemoveRoleFromInstanceProfile
+                  - iam:TagRole
+                  - iam:UntagRole
+                  - iam:TagInstanceProfile
+                  - iam:UntagInstanceProfile
+                Resource:
+                  - !Sub "arn:aws:iam::${AWS::AccountId}:role/parking-app-*"
+                  - !Sub "arn:aws:iam::${AWS::AccountId}:instance-profile/parking-app-*"
+      Tags:
+        - Key: Name
+          Value: GitHub Actions Role
+        - Key: Project
+          Value: parking-app
+        - Key: ManagedBy
+          Value: cloudformation
+
+  # ── Rol: parking-app-backend ──────────────────────────────────────────────────
+  # Usado por los pipelines de deploy en parking-app-backend.
+  # Permisos mínimos: solo actualizar código de Lambdas con prefijo parking-app-*.
+
+  BackendRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: github-actions-parking-app-backend
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !GetAtt GitHubOIDCProvider.Arn
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                "token.actions.githubusercontent.com:aud": sts.amazonaws.com
+              StringLike:
+                "token.actions.githubusercontent.com:sub": !Sub "repo:${GitHubOwner}/parking-app-backend:*"
+      Policies:
+        - PolicyName: lambda-deploy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lambda:UpdateFunctionCode
+                  - lambda:GetFunction
+                  - lambda:GetFunctionConfiguration
+                Resource: !Sub "arn:aws:lambda:*:${AWS::AccountId}:function:*-parking-app-*"
+      Tags:
+        - Key: Name
+          Value: GitHub Actions Backend Role
+        - Key: Project
+          Value: parking-app
+        - Key: ManagedBy
+          Value: cloudformation
+
+Outputs:
+  OIDCProviderArn:
+    Value: !GetAtt GitHubOIDCProvider.Arn
+    Description: ARN del OIDC Provider de GitHub Actions
+    Export:
+      Name: !Sub "${AWS::StackName}-oidc-provider-arn"
+
+  InfraRoleArn:
+    Value: !GetAtt InfraRole.Arn
+    Description: ARN del rol para GitHub Actions en parking-app-infra (AWS_ROLE_ARN secret)
+    Export:
+      Name: !Sub "${AWS::StackName}-infra-role-arn"
+
+  BackendRoleArn:
+    Value: !GetAtt BackendRole.Arn
+    Description: ARN del rol para deploy de Lambdas desde parking-app-backend
+    Export:
+      Name: !Sub "${AWS::StackName}-backend-role-arn"
