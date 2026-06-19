@@ -356,7 +356,7 @@ Outputs:
 
   ClientId:
     Description: "App Client ID → env var COGNITO_CLIENT_ID en la app móvil y VPS"
-    Value: !GetAtt UserPoolClient.ClientId
+    Value: !Ref UserPoolClient
     Export:
       Name: !Sub "${AWS::StackName}-ClientId"
 
