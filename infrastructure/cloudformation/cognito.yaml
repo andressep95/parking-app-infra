@@ -122,9 +122,6 @@ Resources:
       # Previene que un tercero se registre con un RUT de operador válido.
       AdminCreateUserConfig:
         AllowAdminCreateUserOnly: true
-        # Contraseña temporal expira en 3 días — el operador debe cambiarla
-        # al primer login. Evita cuentas huérfanas con password temporal indefinida.
-        UnusedAccountValidityDays: 3
 
       # Password policy
       Policies:

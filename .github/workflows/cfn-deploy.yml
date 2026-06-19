@@ -73,24 +73,26 @@ jobs:
           aws-region: ${{ env.AWS_REGION }}
           role-session-name: github-actions-cfn-deploy
 
-      - name: Delete stack if in ROLLBACK_COMPLETE
+      - name: Deploy CloudFormation stack
+        id: deploy
         run: |
+          # Si el stack está en ROLLBACK_COMPLETE debe borrarse antes de poder recrearlo.
+          # aws cloudformation deploy falla con ValidationError si intenta CreateChangeSet
+          # sobre un stack en ese estado — por eso el delete va en el mismo script.
           STATUS=$(aws cloudformation describe-stacks \
             --stack-name "$STACK_NAME" \
             --query "Stacks[0].StackStatus" \
             --output text 2>/dev/null || echo "DOES_NOT_EXIST")
+
+          echo "Stack status: $STATUS"
+
           if [ "$STATUS" = "ROLLBACK_COMPLETE" ]; then
-            echo "Stack is in ROLLBACK_COMPLETE — deleting before redeploy..."
+            echo "Deleting stack in ROLLBACK_COMPLETE state..."
             aws cloudformation delete-stack --stack-name "$STACK_NAME"
             aws cloudformation wait stack-delete-complete --stack-name "$STACK_NAME"
-            echo "Stack deleted."
-          else
-            echo "Stack status: $STATUS — no cleanup needed."
+            echo "Stack deleted — proceeding with fresh deploy."
           fi
 
-      - name: Deploy CloudFormation stack
-        id: deploy
-        run: |
           echo "Deploying stack: $STACK_NAME"
           aws cloudformation deploy \
             --template-file "$TEMPLATE" \
