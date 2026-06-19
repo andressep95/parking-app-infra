@@ -2,6 +2,8 @@
 
 Repositorio de infraestructura GitOps para **parking-app**. Toda modificación de infraestructura pasa por Pull Request — nunca directamente en AWS.
 
+> **Stack actual:** CloudFormation · GitHub Actions OIDC · Cognito como IdP
+
 ---
 
 ## Tabla de contenidos
@@ -12,30 +14,41 @@ Repositorio de infraestructura GitOps para **parking-app**. Toda modificación d
 - [Flujo GitOps paso a paso](#flujo-gitops-paso-a-paso)
 - [Workflows de GitHub Actions](#workflows-de-github-actions)
 - [Configuración inicial (bootstrap)](#configuración-inicial-bootstrap)
-- [Agregar un nuevo entorno](#agregar-un-nuevo-entorno)
-- [Agregar un nuevo módulo o recurso](#agregar-un-nuevo-módulo-o-recurso)
-- [Detección de drift](#detección-de-drift)
+- [Cognito — decisiones de arquitectura](#cognito--decisiones-de-arquitectura)
 - [Variables y secrets requeridos](#variables-y-secrets-requeridos)
+- [Pendientes](#pendientes)
 
 ---
 
 ## Arquitectura general
 
 ```
-parking-app-infra (este repo)          parking-app-backend
-        │                                      │
-        │  PR → terraform plan                 │  push a develop/main
-        │  merge → terraform apply             │  → build Go + deploy Lambda
-        ▼                                      ▼
-  GitHub Actions ──OIDC──► AWS IAM      GitHub Actions ──OIDC──► AWS IAM
-  role: github-actions-parking-app      role: github-actions-parking-app-backend
-        │                                      │
-        ▼                                      ▼
-   Terraform State                       aws lambda update-function-code
-   S3: control-plane-terraform-states-*       (sin S3, zip directo)
+parking-app-infra (este repo)           parking-app-backend
+        │                                       │
+        │  PR → cfn-validate (changeset)        │  push a develop/main
+        │  merge → cfn-deploy                   │  → build + deploy
+        ▼                                       ▼
+  GitHub Actions ──OIDC──► AWS IAM       GitHub Actions ──OIDC──► AWS IAM
+  role: github-actions-parking-app       role: github-actions-parking-app-backend
+        │                                       │
+        ▼                                       ▼
+  CloudFormation stacks               aws lambda update-function-code
+  parking-app-{env}-cognito                (o equivalente según stack)
+
+
+  Spring Boot (VPS Contabo)
+        │
+        │  POST /auth/login
+        │  → valida terminal en PostgreSQL
+        │  → AdminInitiateAuth (AWS SDK + IAM user)
+        ▼
+  Cognito User Pool
+        │
+        ▼
+  JWT access token (1h) + refresh token (30d)
 ```
 
-La autenticación con AWS es **sin credenciales estáticas**: GitHub Actions obtiene un token OIDC temporal que AWS valida directamente. No hay `AWS_ACCESS_KEY_ID` ni `AWS_SECRET_ACCESS_KEY` en ningún lado.
+La autenticación de GitHub Actions con AWS es **sin credenciales estáticas**: se obtiene un token OIDC temporal que AWS valida directamente contra el proveedor registrado. No hay `AWS_ACCESS_KEY_ID` ni `AWS_SECRET_ACCESS_KEY` en los workflows.
 
 ---
 
@@ -45,132 +58,103 @@ La autenticación con AWS es **sin credenciales estáticas**: GitHub Actions obt
 parking-app-infra/
 ├── .github/
 │   └── workflows/
-│       ├── terraform-plan.yml            # Corre en cada PR → comenta el plan
-│       ├── terraform-apply.yml           # Corre al mergear → aplica los cambios
-│       ├── drift-detection-remediation.yml  # Cada 6h detecta drift y auto-remedia
-│       └── check-pr-source.yml           # Bloquea PRs a main que no vengan de develop
+│       ├── cfn-validate.yml          # PR → crea changeset y comenta el diff
+│       ├── cfn-deploy.yml            # merge → aws cloudformation deploy
+│       ├── cfn-drift-detection.yml   # cada 6h → detecta drift, abre Issue si hay
+│       └── check-pr-source.yml       # bloquea PRs a main que no vengan de develop
 │
 ├── infrastructure/
-│   ├── iam-oidc/
-│   │   └── main.tf                       # Bootstrap: OIDC provider + roles IAM
-│   │
-│   ├── environments/
-│   │   └── dev/                          # Un directorio por entorno
-│   │       ├── main.tf                   # Backend S3 + provider
-│   │       ├── variables.tf
-│   │       ├── outputs.tf
-│   │       ├── data.tf
-│   │       ├── cognito.tf
-│   │       ├── auth_lambda.tf
-│   │       └── api_gateway.tf
-│   │
-│   └── modules/                          # Módulos reutilizables
-│       ├── cognito/
-│       ├── lambda/
-│       └── gateway/
-│           ├── http-v2/
-│           ├── rest-v1/
-│           └── wrapper/
+│   └── cloudformation/
+│       ├── github-oidc.yaml          # Bootstrap: OIDC provider + roles IAM (deploy manual)
+│       └── cognito.yaml              # Cognito User Pool + App Client + Grupos
 │
 └── scripts/
-    ├── init-iam-oidc.sh                  # Aplica el bootstrap de OIDC manualmente
-    └── setup-github.sh                   # Configura variables/secrets/environments en GitHub
+    └── setup-github.sh               # Configura variables/secrets/environments en GitHub
 ```
 
 ---
 
 ## Roles IAM y autenticación OIDC
 
-Existen **dos roles IAM**, cada uno asociado a un repositorio distinto:
+El bootstrap (`github-oidc.yaml`) crea dos roles IAM y el OIDC provider. Stack: `parking-app-github-oidc`.
 
 ### `github-actions-parking-app`
 - **Usado por:** `parking-app-infra` (este repo)
-- **Propósito:** Ejecutar `terraform plan` y `terraform apply`
-- **Permisos:** Acceso amplio a servicios AWS (EC2, RDS, Lambda, S3, Cognito, API GW, etc.) — necesario para que Terraform pueda crear/modificar cualquier recurso
-- **Restricción IAM:** Solo puede crear/modificar roles IAM con prefijo `parking-app-*`
+- **Propósito:** Ejecutar cfn-validate y cfn-deploy
+- **Permisos:** Acceso amplio a servicios AWS (CloudFormation, Cognito, Lambda, S3, etc.)
+- **Restricción IAM:** Solo puede crear/modificar roles con prefijo `parking-app-*`
 - **Trust policy:** `repo:andressep95/parking-app-infra:*`
 
 ### `github-actions-parking-app-backend`
 - **Usado por:** `parking-app-backend`
-- **Propósito:** Desplegar funciones Lambda (update-function-code)
-- **Permisos mínimos:**
-  - `lambda:UpdateFunctionCode`
-  - `lambda:GetFunction`
-  - `lambda:GetFunctionConfiguration`
-- **Scope:** Solo funciones con patrón `*-parking-app-*` (ej: `dev-parking-app-auth-handler`)
+- **Propósito:** Desplegar Lambdas u otros recursos del backend
+- **Permisos mínimos:** `lambda:UpdateFunctionCode`, `lambda:GetFunction`, `lambda:GetFunctionConfiguration`
+- **Scope:** Solo funciones con patrón `*-parking-app-*`
 - **Trust policy:** `repo:andressep95/parking-app-backend:*`
 
 ### Cómo funciona el OIDC
 
 ```
 GitHub Actions Runner
-       │
        │  1. Solicita token OIDC a GitHub
        ▼
 GitHub Token Service
-       │
-       │  2. Emite JWT firmado con claims:
+       │  2. Emite JWT firmado:
        │     sub: repo:andressep95/parking-app-infra:ref:refs/heads/develop
        │     aud: sts.amazonaws.com
        ▼
 AWS STS (AssumeRoleWithWebIdentity)
-       │
-       │  3. Valida JWT contra OIDC provider registrado
-       │     Verifica que sub coincida con la trust policy del rol
+       │  3. Valida JWT, verifica sub contra trust policy del rol
        ▼
   Credenciales temporales (~1h)
-       │
        ▼
-  AWS API calls (Terraform / Lambda deploy)
+  AWS API calls (CloudFormation / Lambda deploy)
 ```
-
-Los roles IAM viven en `infrastructure/iam-oidc/main.tf` y se aplican **manualmente** con `scripts/init-iam-oidc.sh` — este es el único paso fuera del flujo GitOps automático porque es el bootstrap que habilita el resto.
 
 ---
 
 ## Flujo GitOps paso a paso
 
-### Desarrollo normal (feature → dev)
+### Desarrollo normal (feature → develop)
 
 ```
 1. Crear rama desde develop
    git checkout develop && git pull
-   git checkout -b feat/mi-nuevo-recurso
+   git checkout -b feat/mi-cambio
 
-2. Modificar Terraform en infrastructure/environments/dev/ o infrastructure/modules/
+2. Modificar templates en infrastructure/cloudformation/
 
 3. Abrir PR hacia develop
-   → terraform-plan.yml se ejecuta automáticamente
-   → El plan se comenta en el PR (qué se crea, modifica o destruye)
-   → Revisar el plan antes de mergear
+   → cfn-validate crea un changeset y comenta el diff en el PR:
+     🟢 Add | 🟡 Modify | 🔴 Remove  —  recurso  —  ¿requiere reemplazo?
+   → Revisar el changeset antes de mergear
 
 4. Mergear PR a develop
-   → terraform-apply.yml se ejecuta automáticamente
-   → Terraform aplica los cambios en el entorno dev
-   → Los outputs se comentan en el commit
+   → cfn-deploy ejecuta aws cloudformation deploy en el entorno dev
+   → Los outputs del stack se publican en el Step Summary del workflow
 ```
 
 ### Promoción a producción (develop → main)
 
 ```
 5. Abrir PR desde develop hacia main
-   → check-pr-source.yml valida que la rama origen sea develop (bloquea cualquier otra)
-   → terraform-plan.yml corre el plan para prod
+   → check-pr-source.yml valida que el origen sea develop (bloquea cualquier otra)
+   → cfn-validate comenta el changeset para prod
 
-6. Revisar plan de prod y mergear
-   → terraform-apply.yml aplica en prod
-   → El environment 'prod' en GitHub puede tener reviewers requeridos como protección adicional
+6. Revisar changeset de prod y mergear
+   → cfn-deploy aplica en prod
+   → El environment 'prod' en GitHub puede tener reviewers requeridos
 ```
 
 ### Diagrama del flujo completo
 
 ```
-feature/x ──PR──► develop ──merge──► [terraform apply DEV]
+feature/x ──PR──► develop ──merge──► [cfn-deploy DEV]
                      │
                     PR
                      │
                      ▼
-                   main ──merge──► [terraform apply PROD]
+                   main ──merge──► [cfn-deploy PROD]
 ```
 
 **Reglas de protección de ramas:**
@@ -181,35 +165,32 @@ feature/x ──PR──► develop ──merge──► [terraform apply DEV]
 
 ## Workflows de GitHub Actions
 
-### `terraform-plan.yml`
-**Trigger:** Pull request hacia `develop` o `main` con cambios en `infrastructure/`
+### `cfn-validate.yml`
+**Trigger:** Pull request hacia `develop` o `main` con cambios en `infrastructure/cloudformation/`
 
 1. Detecta el entorno destino (`develop` → `dev`, `main` → `prod`)
 2. Autentica con AWS via OIDC
-3. `terraform fmt -check` — valida formato
-4. `terraform init` con backend S3
-5. `terraform validate`
-6. `terraform plan` — genera el plan
-7. Comenta el plan completo en el PR
+3. Crea un changeset (`CREATE` si el stack no existe, `UPDATE` si ya existe)
+4. Espera hasta que el changeset esté listo (poll manual — `aws wait` falla en FAILED state)
+5. Comenta el diff en el PR con tabla: Acción | Recurso | Tipo | ¿Reemplazo?
+6. Elimina el changeset al finalizar (`if: always()`)
 
-### `terraform-apply.yml`
-**Trigger:** Push a `develop` o `main` con cambios en `infrastructure/`
+### `cfn-deploy.yml`
+**Trigger:** Push a `develop` o `main` con cambios en `infrastructure/cloudformation/`
 
 1. Detecta el entorno según la rama
 2. Autentica con AWS via OIDC
-3. `terraform init` con backend S3
-4. `terraform plan -out=tfplan`
-5. `terraform apply tfplan` — aplica los cambios
-6. Comenta los outputs en el commit
+3. `aws cloudformation deploy --no-fail-on-empty-changeset`
+4. Obtiene los outputs del stack y los publica en el Step Summary
 
-**Nota importante:** Este workflow solo se activa con cambios en `infrastructure/environments/**` o `infrastructure/modules/**`. Los cambios en `infrastructure/iam-oidc/` requieren aplicación manual (ver [bootstrap](#configuración-inicial-bootstrap)).
-
-### `drift-detection-remediation.yml`
+### `cfn-drift-detection.yml`
 **Trigger:** Schedule cada 6 horas + manual via `workflow_dispatch`
 
-1. Corre `terraform plan -detailed-exitcode` en cada entorno
-2. Si hay drift (exit code 2): genera reporte JSON, lo sube a S3, abre un Issue en GitHub
-3. Si `AUTO_REMEDIATE=true`: aplica `terraform apply` automáticamente y actualiza el reporte
+1. Verifica que el stack exista (omite si no está desplegado aún)
+2. Lanza drift detection y espera el resultado
+3. Si hay drift: abre un Issue en GitHub con los recursos afectados y las diferencias de propiedades
+4. **No auto-remedia:** CloudFormation no puede corregir drift re-desplegando el mismo template.
+   La remediación es manual: revertir en consola o actualizar el template.
 
 ### `check-pr-source.yml`
 **Trigger:** Pull request hacia `main`
@@ -220,28 +201,27 @@ Valida que la rama origen sea `develop`. Si no, el PR queda bloqueado.
 
 ## Configuración inicial (bootstrap)
 
-Estos pasos se hacen **una sola vez** al crear el proyecto. Ya están aplicados en parking-app.
+Estos pasos se hacen **una sola vez** al crear el proyecto en una cuenta AWS nueva.
 
 ### Prerequisitos
 
 ```bash
-brew install gh terraform
+brew install gh awscli
 gh auth login
-aws configure  # o exportar AWS_PROFILE
+# Tener credenciales AWS temporales disponibles para el deploy manual
 ```
 
-### Paso 1 — Aplicar OIDC y roles IAM
+### Paso 1 — Desplegar el bootstrap IAM (una vez, manual)
 
 ```bash
-cd parking-app-infra
-bash scripts/init-iam-oidc.sh
+aws cloudformation deploy \
+  --template-file infrastructure/cloudformation/github-oidc.yaml \
+  --stack-name parking-app-github-oidc \
+  --capabilities CAPABILITY_NAMED_IAM \
+  --region us-east-1
 ```
 
-Este script:
-- Inicializa Terraform en `infrastructure/iam-oidc/`
-- Importa el OIDC provider si ya existe en la cuenta (para no duplicarlo)
-- Crea los dos roles IAM (`github-actions-parking-app` y `github-actions-parking-app-backend`)
-- Muestra los ARNs de salida
+Esto crea el OIDC provider y los dos roles IAM. Sin este stack, los workflows de GitHub Actions no pueden autenticar con AWS.
 
 ### Paso 2 — Configurar GitHub
 
@@ -249,72 +229,66 @@ Este script:
 bash scripts/setup-github.sh
 ```
 
-Este script configura en el repo de GitHub:
-- **Variables:** `PROJECT_NAME`, `AWS_REGION`, `TF_STATE_BUCKET`, `DRIFT_DETECTION_SCHEDULE`, `AUTO_REMEDIATE`
-- **Secret:** `AWS_ROLE_ARN` (ARN del rol de infra)
-- **Environments:** `dev` y `prod`
+Configura en el repo:
+- **Variables:** `PROJECT_NAME`, `AWS_REGION`
+- **Secret:** `AWS_ROLE_ARN`
+- **Environments:** `dev` (y `prod` si aplica)
 - **Protección de ramas:** `main` y `develop`
 
-### Paso 3 — Configurar parking-app-backend
+### Paso 3 — Primer despliegue de Cognito
 
 ```bash
-cd ../parking-app-backend
-gh secret set AWS_ROLE_ARN --body "arn:aws:iam::ACCOUNT_ID:role/github-actions-parking-app-backend"
-gh variable set PROJECT_NAME --body "parking-app"
-gh variable set AWS_REGION --body "us-east-1"
-```
-
-### Estado actual del backend S3
-
-El estado de Terraform se guarda en:
-
-| Módulo | S3 Key |
-|--------|--------|
-| iam-oidc | `parking-app/iam-oidc/terraform.tfstate` |
-| dev | `parking-app/dev/terraform.tfstate` |
-| prod (futuro) | `parking-app/prod/terraform.tfstate` |
-
-**Bucket:** `control-plane-terraform-states-970547363172` (cuenta `970547363172`, región `us-east-1`)
-
----
-
-## Agregar un nuevo entorno
-
-1. Copiar `infrastructure/environments/dev/` a `infrastructure/environments/prod/`
-2. Ajustar variables (nombre de entorno, tamaños, configuraciones de prod)
-3. El workflow detecta el directorio automáticamente al hacer PR a `main`
-
----
-
-## Agregar un nuevo módulo o recurso
-
-1. Si es un recurso reutilizable: crear módulo en `infrastructure/modules/mi-modulo/`
-2. Llamar al módulo desde `infrastructure/environments/dev/mi-recurso.tf`
-3. Abrir PR a `develop` → el plan mostrará los recursos nuevos antes de aplicar
-
-Convención de nombres de recursos AWS:
-```
-{environment}-{project_name}-{recurso}
-Ejemplo: dev-parking-app-auth-handler
+git checkout -b feat/initial-cognito
+# (sin cambios necesarios — solo para trigger el workflow)
+git push origin feat/initial-cognito
+# Abrir PR a develop → cfn-validate comenta el changeset → mergear → cfn-deploy crea el stack
 ```
 
 ---
 
-## Detección de drift
+## Cognito — decisiones de arquitectura
 
-El drift ocurre cuando alguien modifica recursos en AWS directamente (fuera de Terraform). El workflow de drift detection corre cada 6 horas y:
+### Flujo de autenticación
 
-- **Sin drift:** registra `✅ No drift detected` en el summary
-- **Con drift y `AUTO_REMEDIATE=true`:** aplica terraform automáticamente y abre un Issue
-- **Con drift y `AUTO_REMEDIATE=false`:** solo genera reporte y abre un Issue
+El backend (Spring Boot en VPS) **intercepta todos los logins** para validar que el usuario opera desde una terminal autorizada antes de autenticar contra Cognito:
 
-Los reportes se guardan en S3:
 ```
-s3://control-plane-terraform-states-970547363172/parking-app/{env}/drift-reports/{fecha}/drift-{hora}.json
+Terminal/App → POST /auth/login → Spring Boot
+                                   ├─ ¿terminal en PostgreSQL? ─► 401 si no
+                                   └─ AdminInitiateAuth (SDK + IAM)
+                                              │
+                                              ▼
+                                         Cognito
+                                              │
+                                              ▼
+                                   access token + refresh token
+                                              │
+                                   ◄──────────┘
 ```
 
-Para disparar manualmente desde GitHub Actions:
-> Actions → Drift Detection & Auto-Remediation → Run workflow
+Por este motivo el app client tiene `ALLOW_ADMIN_USER_PASSWORD_AUTH` y **no** `ALLOW_USER_SRP_AUTH` — este último permitiría al cliente ir directo a Cognito saltándose la validación de terminal.
+
+### Grupos RBAC
+
+| Grupo | Precedencia | Descripción |
+|-------|------------|-------------|
+| `ADMIN` | 0 | Equipo interno — acceso total |
+| `CUSTOMER` | 10 | Empresa cliente — gestiona sus locations y operadores |
+| `OPERATOR` | 20 | Cajero — opera el terminal en una location asignada |
+
+Spring Boot lee el claim `cognito:groups` del JWT y lo convierte en roles de Spring Security via `JwtGrantedAuthoritiesConverter`.
+
+### Usuarios
+
+Solo admins crean usuarios (`AdminCreateUserOnly: true`). No hay autoregistro. La contraseña temporal expira en 3 días.
+
+### Tokens
+
+| Token | Validez | Notas |
+|-------|---------|-------|
+| Access token | 1 hora | Valida cada request HTTP en Spring Boot |
+| ID token | 1 hora | Mismo lifetime que access token |
+| Refresh token | 30 días | Para terminales TUU con uso diario continuo |
 
 ---
 
@@ -324,17 +298,25 @@ Para disparar manualmente desde GitHub Actions:
 
 | Nombre | Tipo | Valor | Descripción |
 |--------|------|-------|-------------|
-| `PROJECT_NAME` | Variable | `parking-app` | Prefijo de recursos y clave de estado |
+| `PROJECT_NAME` | Variable | `parking-app` | Prefijo para nombres de stacks |
 | `AWS_REGION` | Variable | `us-east-1` | Región AWS |
-| `TF_STATE_BUCKET` | Variable | `control-plane-terraform-states-970547363172` | Bucket del estado Terraform |
-| `DRIFT_DETECTION_SCHEDULE` | Variable | `0 */6 * * *` | Referencial (el cron está hardcodeado en el workflow) |
-| `AUTO_REMEDIATE` | Variable | `false` | Auto-aplicar en caso de drift |
-| `AWS_ROLE_ARN` | Secret | `arn:aws:iam::970547363172:role/github-actions-parking-app` | Rol OIDC para Terraform |
+| `AWS_ROLE_ARN` | Secret | `arn:aws:iam::970547363172:role/github-actions-parking-app` | Rol OIDC para cfn-deploy |
 
 ### `parking-app-backend`
 
 | Nombre | Tipo | Valor | Descripción |
 |--------|------|-------|-------------|
-| `PROJECT_NAME` | Variable | `parking-app` | Prefijo de funciones Lambda |
+| `PROJECT_NAME` | Variable | `parking-app` | Prefijo de recursos |
 | `AWS_REGION` | Variable | `us-east-1` | Región AWS |
-| `AWS_ROLE_ARN` | Secret | `arn:aws:iam::970547363172:role/github-actions-parking-app-backend` | Rol OIDC para deploy de Lambdas |
+| `AWS_ROLE_ARN` | Secret | `arn:aws:iam::970547363172:role/github-actions-parking-app-backend` | Rol OIDC para deploy |
+
+---
+
+## Pendientes
+
+- [ ] **IAM user para VPS (runtime):** Crear IAM user con permisos mínimos para que Spring Boot pueda llamar `AdminInitiateAuth` desde el VPS Contabo. Scope: `cognito-idp:AdminInitiateAuth` + `cognito-idp:AdminUserGlobalSignOut` sobre el ARN del User Pool del entorno correspondiente.
+- [ ] **Variables de entorno Spring Boot:** Una vez desplegado el stack Cognito, configurar en el VPS:
+  - `COGNITO_USER_POOL_ID` → output `UserPoolId` del stack `parking-app-dev-cognito`
+  - `COGNITO_CLIENT_ID` → output `ClientId`
+  - `SPRING_SECURITY_OAUTH2_RESOURCESERVER_JWT_ISSUER_URI` → output `IssuerUrl`
+  - `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` del IAM user de runtime
