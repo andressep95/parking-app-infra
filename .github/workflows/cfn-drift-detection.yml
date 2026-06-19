@@ -1,0 +1,201 @@
+name: "CloudFormation Drift Detection"
+
+# CloudFormation detecta drift comparando el estado actual de los recursos
+# con lo que CloudFormation desplegó por última vez.
+# A diferencia de Terraform, CloudFormation NO puede auto-remediar drift
+# volviendo a desplegar el mismo template sin cambios — solo informa.
+# Remediación: revertir los cambios manuales en la consola AWS
+# o actualizar el template para reflejar el nuevo estado deseado.
+
+on:
+  schedule:
+    - cron: "0 */6 * * *"
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Entorno a verificar'
+        required: false
+        type: choice
+        options:
+          - dev
+          - prod
+
+permissions:
+  id-token: write
+  contents: read
+  issues: write
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION }}
+
+jobs:
+  detect-drift:
+    name: "Drift — ${{ matrix.environment }}"
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        environment: ${{ github.event.inputs.environment && fromJSON(format('["{0}"]', github.event.inputs.environment)) || fromJSON('["dev"]') }}
+      fail-fast: false
+
+    env:
+      ENV: ${{ matrix.environment }}
+      STACK_NAME: "${{ vars.PROJECT_NAME }}-${{ matrix.environment }}-cognito"
+
+    steps:
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: github-actions-cfn-drift
+
+      - name: Check if stack exists
+        id: stack_check
+        run: |
+          if aws cloudformation describe-stacks --stack-name "$STACK_NAME" 2>/dev/null | jq -e '.Stacks[0]' > /dev/null; then
+            echo "exists=true"  >> $GITHUB_OUTPUT
+            STATUS=$(aws cloudformation describe-stacks --stack-name "$STACK_NAME" \
+              --query "Stacks[0].StackStatus" --output text)
+            echo "status=$STATUS" >> $GITHUB_OUTPUT
+            echo "Stack $STACK_NAME exists: $STATUS"
+          else
+            echo "exists=false" >> $GITHUB_OUTPUT
+            echo "Stack $STACK_NAME does not exist — skipping drift detection"
+          fi
+
+      - name: Initiate drift detection
+        id: initiate
+        if: steps.stack_check.outputs.exists == 'true'
+        run: |
+          DETECTION_ID=$(aws cloudformation detect-stack-drift \
+            --stack-name "$STACK_NAME" \
+            --query "StackDriftDetectionId" --output text)
+          echo "detection_id=$DETECTION_ID" >> $GITHUB_OUTPUT
+          echo "Drift detection started: $DETECTION_ID"
+
+      - name: Wait for drift detection to complete
+        id: wait_drift
+        if: steps.initiate.outcome == 'success'
+        run: |
+          DETECTION_ID="${{ steps.initiate.outputs.detection_id }}"
+          echo "Polling drift detection status..."
+          for i in {1..20}; do
+            RESULT=$(aws cloudformation describe-stack-drift-detection-status \
+              --stack-drift-detection-id "$DETECTION_ID" --output json)
+            STATUS=$(echo "$RESULT" | jq -r '.DetectionStatus')
+            echo "  Attempt $i: $STATUS"
+            if [[ "$STATUS" == "DETECTION_COMPLETE" || "$STATUS" == "DETECTION_FAILED" ]]; then
+              DRIFT_STATUS=$(echo "$RESULT" | jq -r '.StackDriftStatus')
+              echo "detection_status=$STATUS"    >> $GITHUB_OUTPUT
+              echo "drift_status=$DRIFT_STATUS"  >> $GITHUB_OUTPUT
+              echo "Drift status: $DRIFT_STATUS"
+              break
+            fi
+            sleep 10
+          done
+
+      - name: Get drifted resources
+        id: drifted_resources
+        if: steps.wait_drift.outputs.drift_status == 'DRIFTED'
+        run: |
+          DRIFTS=$(aws cloudformation describe-stack-resource-drifts \
+            --stack-name "$STACK_NAME" \
+            --stack-resource-drift-status-filters MODIFIED DELETED \
+            --output json 2>/dev/null || echo '{"StackResourceDrifts":[]}')
+          echo "json<<EOF"  >> $GITHUB_OUTPUT
+          echo "$DRIFTS"    >> $GITHUB_OUTPUT
+          echo "EOF"        >> $GITHUB_OUTPUT
+
+      - name: Write Step Summary
+        if: steps.stack_check.outputs.exists == 'true'
+        run: |
+          DRIFT_STATUS="${{ steps.wait_drift.outputs.drift_status }}"
+          TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+          echo "## CloudFormation Drift Detection — $STACK_NAME" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Environment:** $ENV" >> $GITHUB_STEP_SUMMARY
+          echo "**Detected at:** $TIMESTAMP" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          if [ "$DRIFT_STATUS" = "IN_SYNC" ]; then
+            echo "### ✅ Sin drift — infraestructura en sync con el template" >> $GITHUB_STEP_SUMMARY
+          elif [ "$DRIFT_STATUS" = "DRIFTED" ]; then
+            echo "### 🚨 Drift detectado" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "${{ steps.drifted_resources.outputs.json }}" \
+              | jq -r '.StackResourceDrifts[] | "- **\(.ResourceType)** `\(.LogicalResourceId)`: \(.StackResourceDriftStatus)"' \
+              >> $GITHUB_STEP_SUMMARY 2>/dev/null || true
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "**Acción recomendada:** Revisar los cambios manuales en la consola AWS y revertirlos, o actualizar el template CloudFormation para reflejar el estado deseado." >> $GITHUB_STEP_SUMMARY
+          else
+            echo "### ⚠️ Drift status: $DRIFT_STATUS" >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: Create GitHub Issue for Drift
+        if: steps.wait_drift.outputs.drift_status == 'DRIFTED'
+        uses: actions/github-script@v7
+        env:
+          DRIFTS_JSON: ${{ steps.drifted_resources.outputs.json }}
+        with:
+          script: |
+            const env           = '${{ matrix.environment }}';
+            const stackName     = '${{ env.STACK_NAME }}';
+            const driftTime     = new Date().toISOString();
+            const runUrl        = `${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}`;
+
+            let driftList = '';
+            try {
+              const data   = JSON.parse(process.env.DRIFTS_JSON || '{"StackResourceDrifts":[]}');
+              const drifts = data.StackResourceDrifts || [];
+              driftList = drifts.map(d => [
+                `- **\`${d.LogicalResourceId}\`** (${d.ResourceType})`,
+                `  - Estado: \`${d.StackResourceDriftStatus}\``,
+                d.PropertyDifferences?.map(p =>
+                  `  - \`${p.PropertyPath}\`: esperado \`${JSON.stringify(p.ExpectedValue)}\` → actual \`${JSON.stringify(p.ActualValue)}\``
+                ).join('\n') || ''
+              ].join('\n')).join('\n');
+            } catch (_) {
+              driftList = '_Error obteniendo detalles_';
+            }
+
+            const body = [
+              `## 🚨 CloudFormation Drift Detectado`,
+              '',
+              `**Stack:** \`${stackName}\`  `,
+              `**Environment:** \`${env}\`  `,
+              `**Detectado:** ${driftTime}`,
+              '',
+              '### Recursos con drift',
+              '',
+              driftList,
+              '',
+              '### Qué hacer',
+              '',
+              '1. Revisar el [workflow run](' + runUrl + ') para ver los detalles completos',
+              '2. Identificar quién realizó los cambios manuales en la consola AWS',
+              '3. **Opción A:** Revertir los cambios manuales en la consola (volver al estado del template)',
+              '4. **Opción B:** Actualizar el template CloudFormation para reflejar el nuevo estado deseado y hacer un PR',
+              '',
+              '> **Nota:** CloudFormation no puede auto-remediar drift re-desplegando el mismo template.',
+              '> El drift persiste hasta que se corrija manualmente o se actualice el template.',
+              '',
+              '---',
+              '*Este issue fue creado automáticamente por el workflow de Drift Detection.*'
+            ].join('\n');
+
+            await github.rest.issues.create({
+              owner:  context.repo.owner,
+              repo:   context.repo.repo,
+              title:  `[${env.toUpperCase()}] Drift Detectado en ${stackName} — ${driftTime.split('T')[0]}`,
+              body,
+              labels: ['drift-detection', `env:${env}`]
+            });
+
+      - name: No drift / stack missing
+        if: steps.stack_check.outputs.exists == 'false'
+        run: echo "⏭️  Stack $STACK_NAME no existe aún — omitiendo drift detection" >> $GITHUB_STEP_SUMMARY
+
+      - name: No drift summary
+        if: steps.wait_drift.outputs.drift_status == 'IN_SYNC'
+        run: echo "✅ No drift detectado en $STACK_NAME — infraestructura en sync con Git" >> $GITHUB_STEP_SUMMARY

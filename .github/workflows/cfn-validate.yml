@@ -1,0 +1,233 @@
+name: "CloudFormation Validate & Change Set"
+
+on:
+  pull_request:
+    branches:
+      - develop   # feature/* → develop triggers dev change set
+      - main      # develop → main triggers prod change set
+    paths:
+      - 'infrastructure/cloudformation/**'
+      - '.github/workflows/cfn-validate.yml'
+
+permissions:
+  id-token: write
+  contents: read
+  pull-requests: write
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION }}
+
+jobs:
+  detect-changes:
+    name: "Detect Target Environment"
+    runs-on: ubuntu-latest
+    outputs:
+      environments: ${{ steps.detect.outputs.environments }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Detect target environment
+        id: detect
+        run: |
+          TARGET_BRANCH="${{ github.base_ref }}"
+          ENVIRONMENTS=()
+
+          if [ "$TARGET_BRANCH" = "develop" ]; then
+            ENVIRONMENTS+=("dev")
+          elif [ "$TARGET_BRANCH" = "main" ]; then
+            [ -d "infrastructure/environments/prod" ] || ENVIRONMENTS+=("prod")
+            ENVIRONMENTS+=("prod")
+          fi
+
+          if [ ${#ENVIRONMENTS[@]} -eq 0 ]; then
+            ENVIRONMENTS_JSON="[]"
+          else
+            ENVIRONMENTS_JSON=$(printf '%s\n' "${ENVIRONMENTS[@]}" | jq -R . | jq -s -c .)
+          fi
+          echo "environments=${ENVIRONMENTS_JSON}" >> $GITHUB_OUTPUT
+          echo "Target branch: ${TARGET_BRANCH} → environments: ${ENVIRONMENTS_JSON}"
+
+  cfn-validate:
+    name: "Validate & Change Set — ${{ matrix.environment }}"
+    runs-on: ubuntu-latest
+    needs: detect-changes
+    if: needs.detect-changes.outputs.environments != '[]'
+    strategy:
+      matrix:
+        environment: ${{ fromJson(needs.detect-changes.outputs.environments) }}
+      fail-fast: false
+
+    env:
+      ENV: ${{ matrix.environment }}
+      STACK_NAME: "${{ vars.PROJECT_NAME }}-${{ matrix.environment }}-cognito"
+      CHANGESET_NAME: "pr-${{ github.event.number }}-${{ github.run_id }}"
+      TEMPLATE: "infrastructure/cloudformation/cognito.yaml"
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: github-actions-cfn-validate
+
+      - name: Validate CloudFormation template
+        id: validate
+        run: |
+          echo "Validating template: $TEMPLATE"
+          aws cloudformation validate-template \
+            --template-body file://$TEMPLATE \
+            --region ${{ env.AWS_REGION }}
+        continue-on-error: true
+
+      - name: Check stack existence
+        id: stack_check
+        run: |
+          STACK_INFO=$(aws cloudformation describe-stacks --stack-name "$STACK_NAME" 2>&1 || true)
+          if echo "$STACK_INFO" | grep -q '"StackStatus"'; then
+            STACK_STATUS=$(echo "$STACK_INFO" | jq -r '.Stacks[0].StackStatus')
+            echo "exists=true"           >> $GITHUB_OUTPUT
+            echo "status=${STACK_STATUS}" >> $GITHUB_OUTPUT
+            echo "changeset_type=UPDATE"  >> $GITHUB_OUTPUT
+            echo "Stack exists: ${STACK_STATUS}"
+          else
+            echo "exists=false"             >> $GITHUB_OUTPUT
+            echo "status=DOES_NOT_EXIST"    >> $GITHUB_OUTPUT
+            echo "changeset_type=CREATE"    >> $GITHUB_OUTPUT
+            echo "Stack does not exist — first deployment"
+          fi
+
+      - name: Create Change Set
+        id: create_changeset
+        if: steps.validate.outcome == 'success'
+        run: |
+          aws cloudformation create-change-set \
+            --stack-name "$STACK_NAME" \
+            --template-body file://$TEMPLATE \
+            --parameters \
+              ParameterKey=Environment,ParameterValue=$ENV \
+              ParameterKey=ProjectName,ParameterValue=${{ vars.PROJECT_NAME }} \
+            --change-set-name "$CHANGESET_NAME" \
+            --change-set-type ${{ steps.stack_check.outputs.changeset_type }} \
+            --capabilities CAPABILITY_IAM CAPABILITY_NAMED_IAM CAPABILITY_AUTO_EXPAND
+
+          echo "Waiting for change set..."
+          for i in {1..30}; do
+            STATUS=$(aws cloudformation describe-change-set \
+              --stack-name "$STACK_NAME" \
+              --change-set-name "$CHANGESET_NAME" \
+              --query "Status" --output text 2>/dev/null || echo "UNKNOWN")
+            echo "  Attempt $i: $STATUS"
+            if [[ "$STATUS" == "CREATE_COMPLETE" || "$STATUS" == "FAILED" ]]; then
+              echo "changeset_status=$STATUS" >> $GITHUB_OUTPUT
+              break
+            fi
+            sleep 5
+          done
+        continue-on-error: true
+
+      - name: Describe Change Set
+        id: describe_changeset
+        if: steps.create_changeset.outcome != 'skipped'
+        run: |
+          RESULT=$(aws cloudformation describe-change-set \
+            --stack-name "$STACK_NAME" \
+            --change-set-name "$CHANGESET_NAME" \
+            --output json 2>&1 || echo '{}')
+          echo "json<<EOF"  >> $GITHUB_OUTPUT
+          echo "$RESULT"    >> $GITHUB_OUTPUT
+          echo "EOF"        >> $GITHUB_OUTPUT
+        continue-on-error: true
+
+      - name: Comment PR with Change Set
+        uses: actions/github-script@v7
+        if: always() && github.event_name == 'pull_request'
+        env:
+          CHANGESET_JSON: ${{ steps.describe_changeset.outputs.json }}
+          VALIDATE_OUTCOME: ${{ steps.validate.outcome }}
+          CHANGESET_STATUS: ${{ steps.create_changeset.outputs.changeset_status }}
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const env           = '${{ matrix.environment }}';
+            const stackName     = '${{ env.STACK_NAME }}';
+            const validateOk    = process.env.VALIDATE_OUTCOME === 'success';
+            const csStatus      = process.env.CHANGESET_STATUS || 'N/A';
+
+            let changesSection = '';
+            try {
+              const cs          = JSON.parse(process.env.CHANGESET_JSON || '{}');
+              const changes     = cs.Changes || [];
+              const statusReason = cs.StatusReason || '';
+              const noChanges   = statusReason.includes("didn't contain changes")
+                                || statusReason.includes("No updates");
+
+              if (noChanges) {
+                changesSection = '> ✅ Sin cambios — el stack ya está actualizado.';
+              } else if (csStatus === 'FAILED') {
+                changesSection = `> ⚠️ Change set falló: ${statusReason}`;
+              } else if (changes.length > 0) {
+                const rows = changes.map(c => {
+                  const r    = c.ResourceChange;
+                  const act  = r.Action === 'Add'    ? '🟢 Add'
+                             : r.Action === 'Remove' ? '🔴 Remove'
+                             :                         '🟡 Modify';
+                  const repl = r.Replacement === 'True'        ? '⚠️ Sí'
+                             : r.Replacement === 'Conditional' ? '⚠️ Condicional'
+                             :                                    'No';
+                  return `| ${act} | \`${r.LogicalResourceId}\` | \`${r.ResourceType}\` | ${repl} |`;
+                }).join('\n');
+                changesSection = `| Acción | Recurso | Tipo | Reemplazo? |\n|--------|---------|------|------------|\n${rows}`;
+              } else {
+                changesSection = '> ❓ No se pudo determinar el estado del change set.';
+              }
+            } catch (_) {
+              changesSection = '> ❌ Error parseando el change set.';
+            }
+
+            const vIcon = validateOk ? '✅' : '❌';
+            const cIcon = csStatus === 'CREATE_COMPLETE'              ? '✅'
+                        : (csStatus === 'FAILED' && changesSection.includes('Sin cambios')) ? '✅'
+                        : csStatus === 'FAILED'                       ? '⚠️'
+                        :                                               '❓';
+
+            const body = [
+              `#### CloudFormation Change Set — \`${env}\` ☁️`,
+              '',
+              `**Stack:** \`${stackName}\``,
+              '',
+              `| Check | Estado |`,
+              `|-------|--------|`,
+              `| Validación del template | ${vIcon} \`${{ steps.validate.outcome }}\` |`,
+              `| Change Set | ${cIcon} \`${csStatus}\` |`,
+              '',
+              '<details><summary>Cambios detectados</summary>',
+              '',
+              changesSection,
+              '',
+              '</details>',
+              '',
+              `*Pusher: @${{ github.actor }}, PR: #${{ github.event.number }}, Workflow: \`${{ github.workflow }}\`*`
+            ].join('\n');
+
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner:        context.repo.owner,
+              repo:         context.repo.repo,
+              body
+            });
+
+      - name: Delete Change Set (cleanup)
+        if: always() && steps.create_changeset.outcome != 'skipped'
+        run: |
+          aws cloudformation delete-change-set \
+            --stack-name "$STACK_NAME" \
+            --change-set-name "$CHANGESET_NAME" 2>/dev/null || true
+
+      - name: Fail if validation failed
+        if: steps.validate.outcome == 'failure'
+        run: exit 1

@@ -1,7 +1,7 @@
 #!/bin/bash
 set -e
 
-# Setup completo de GitHub para parking-app-infra (GitOps + AWS)
+# Setup completo de GitHub para parking-app-infra (GitOps + CloudFormation + AWS)
 # Configura: variables de repositorio, secrets, environments y protección de ramas
 # Requiere: gh CLI instalado y autenticado
 #
@@ -9,8 +9,8 @@ set -e
 PROJECT_NAME="parking-app"
 # ──────────────────────────────────────────────────────────────────────────────
 
-echo "🚀 GitHub Project Setup — parking-app-infra (GitOps + AWS)"
-echo "==========================================================="
+echo "🚀 GitHub Project Setup — parking-app-infra (GitOps + CloudFormation)"
+echo "======================================================================="
 echo ""
 
 # ─── Verificaciones previas ───────────────────────────────────────────────────
@@ -47,16 +47,6 @@ echo ""
 read -p "AWS_REGION [us-east-1]: " AWS_REGION
 AWS_REGION=${AWS_REGION:-us-east-1}
 
-DEFAULT_BUCKET="control-plane-terraform-states-${AWS_ACCOUNT_ID}"
-read -p "TF_STATE_BUCKET [${DEFAULT_BUCKET}]: " TF_STATE_BUCKET
-TF_STATE_BUCKET=${TF_STATE_BUCKET:-$DEFAULT_BUCKET}
-
-read -p "DRIFT_DETECTION_SCHEDULE [0 */6 * * *]: " DRIFT_SCHEDULE
-DRIFT_SCHEDULE=${DRIFT_SCHEDULE:-"0 */6 * * *"}
-
-read -p "AUTO_REMEDIATE [true]: " AUTO_REMEDIATE
-AUTO_REMEDIATE=${AUTO_REMEDIATE:-true}
-
 # ─── Secrets ──────────────────────────────────────────────────────────────────
 
 echo ""
@@ -87,9 +77,6 @@ echo ""
 echo "  Variables:"
 echo "    PROJECT_NAME             = $PROJECT_NAME"
 echo "    AWS_REGION               = $AWS_REGION"
-echo "    TF_STATE_BUCKET          = $TF_STATE_BUCKET"
-echo "    DRIFT_DETECTION_SCHEDULE = $DRIFT_SCHEDULE"
-echo "    AUTO_REMEDIATE           = $AUTO_REMEDIATE"
 echo ""
 echo "  Secrets:"
 echo "    AWS_ROLE_ARN             = ${AWS_ROLE_ARN:0:60}..."
@@ -101,6 +88,10 @@ echo ""
 echo "  Protección de ramas:"
 echo "    main    → PR requerido + solo desde develop"
 echo "    develop → PR requerido"
+echo ""
+echo "  Stacks CloudFormation que se crearán al hacer push:"
+[[ "$CREATE_DEV"  =~ ^[Yy]$ ]] && echo "    ${PROJECT_NAME}-dev-cognito"
+[[ "$CREATE_PROD" =~ ^[Yy]$ ]] && echo "    ${PROJECT_NAME}-prod-cognito"
 echo ""
 
 read -p "¿Aplicar? [Y/n]: " CONFIRM
@@ -115,11 +106,8 @@ fi
 echo ""
 echo "📋 Configurando variables..."
 
-gh variable set PROJECT_NAME             --body "$PROJECT_NAME"    && echo "  ✅ PROJECT_NAME"
-gh variable set AWS_REGION               --body "$AWS_REGION"      && echo "  ✅ AWS_REGION"
-gh variable set TF_STATE_BUCKET          --body "$TF_STATE_BUCKET" && echo "  ✅ TF_STATE_BUCKET"
-gh variable set DRIFT_DETECTION_SCHEDULE --body "$DRIFT_SCHEDULE"  && echo "  ✅ DRIFT_DETECTION_SCHEDULE"
-gh variable set AUTO_REMEDIATE           --body "$AUTO_REMEDIATE"  && echo "  ✅ AUTO_REMEDIATE"
+gh variable set PROJECT_NAME --body "$PROJECT_NAME" && echo "  ✅ PROJECT_NAME"
+gh variable set AWS_REGION   --body "$AWS_REGION"   && echo "  ✅ AWS_REGION"
 
 # ─── Aplicar secrets ─────────────────────────────────────────────────────────
 
@@ -194,9 +182,11 @@ echo ""
 echo "✅ Setup completo: $REPO"
 echo ""
 echo "Próximos pasos:"
-echo "  1. En aws-monitor: aplicar iam-oidc para crear el rol IAM"
-echo "     cd ../aws-monitor/infrastructure/iam-oidc && terraform apply"
-echo "  2. Crear rama develop: git checkout -b develop && git push -u origin develop"
-echo "  3. Crear feature branch y abrir PR a develop"
-echo "     → terraform plan corre automáticamente y comenta en el PR"
-echo "  4. Merge a develop → terraform apply automático en dev"
+echo "  1. Aplicar la actualización del IAM role (agrega cloudformation:*):"
+echo "     cd infrastructure/iam-oidc && terraform apply"
+echo "  2. Destruir la infra Terraform existente si hay recursos desplegados:"
+echo "     (recuperar el módulo desde git history o hacer destroy manual en consola)"
+echo "  3. Crear rama develop: git checkout -b develop && git push -u origin develop"
+echo "  4. Crear feature branch y abrir PR a develop:"
+echo "     → cfn-validate corre automáticamente y comenta el change set en el PR"
+echo "  5. Merge a develop → cfn-deploy despliega el stack CloudFormation en dev"

@@ -1,0 +1,154 @@
+name: "CloudFormation Deploy"
+
+on:
+  push:
+    branches:
+      - develop   # merge to develop → deploy dev
+      - main      # merge to main → deploy prod
+    paths:
+      - 'infrastructure/cloudformation/**'
+
+permissions:
+  id-token: write
+  contents: write
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION }}
+
+jobs:
+  detect-changes:
+    name: "Detect Target Environment"
+    runs-on: ubuntu-latest
+    outputs:
+      environments: ${{ steps.detect.outputs.environments }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Detect target environment
+        id: detect
+        run: |
+          TARGET_BRANCH="${{ github.ref_name }}"
+          ENVIRONMENTS=()
+
+          if [ "$TARGET_BRANCH" = "develop" ]; then
+            ENVIRONMENTS+=("dev")
+          elif [ "$TARGET_BRANCH" = "main" ]; then
+            ENVIRONMENTS+=("prod")
+          fi
+
+          if [ ${#ENVIRONMENTS[@]} -eq 0 ]; then
+            ENVIRONMENTS_JSON="[]"
+          else
+            ENVIRONMENTS_JSON=$(printf '%s\n' "${ENVIRONMENTS[@]}" | jq -R . | jq -s -c .)
+          fi
+          echo "environments=${ENVIRONMENTS_JSON}" >> $GITHUB_OUTPUT
+          echo "Target branch: ${TARGET_BRANCH} → environments: ${ENVIRONMENTS_JSON}"
+
+  cfn-deploy:
+    name: "Deploy — ${{ matrix.environment }}"
+    runs-on: ubuntu-latest
+    needs: detect-changes
+    if: needs.detect-changes.outputs.environments != '[]'
+    environment: ${{ matrix.environment }}
+    strategy:
+      matrix:
+        environment: ${{ fromJson(needs.detect-changes.outputs.environments) }}
+      max-parallel: 1
+      fail-fast: true
+
+    env:
+      ENV: ${{ matrix.environment }}
+      STACK_NAME: "${{ vars.PROJECT_NAME }}-${{ matrix.environment }}-cognito"
+      TEMPLATE: "infrastructure/cloudformation/cognito.yaml"
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: github-actions-cfn-deploy
+
+      - name: Deploy CloudFormation stack
+        id: deploy
+        run: |
+          echo "Deploying stack: $STACK_NAME"
+          aws cloudformation deploy \
+            --template-file "$TEMPLATE" \
+            --stack-name "$STACK_NAME" \
+            --parameter-overrides \
+              Environment=$ENV \
+              ProjectName=${{ vars.PROJECT_NAME }} \
+            --capabilities CAPABILITY_IAM CAPABILITY_NAMED_IAM CAPABILITY_AUTO_EXPAND \
+            --no-fail-on-empty-changeset \
+            --region ${{ env.AWS_REGION }}
+
+      - name: Get stack outputs
+        id: outputs
+        run: |
+          OUTPUTS=$(aws cloudformation describe-stacks \
+            --stack-name "$STACK_NAME" \
+            --query "Stacks[0].Outputs" \
+            --output json 2>/dev/null || echo '[]')
+          echo "json<<EOF" >> $GITHUB_OUTPUT
+          echo "$OUTPUTS"  >> $GITHUB_OUTPUT
+          echo "EOF"       >> $GITHUB_OUTPUT
+
+          echo "## Stack Outputs — $STACK_NAME" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Output Key | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|------------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "$OUTPUTS" | jq -r '.[] | "| `\(.OutputKey)` | `\(.OutputValue)` |"' \
+            >> $GITHUB_STEP_SUMMARY 2>/dev/null || true
+        continue-on-error: true
+
+      - name: Comment on commit with outputs
+        uses: actions/github-script@v7
+        env:
+          OUTPUTS_JSON: ${{ steps.outputs.outputs.json }}
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const stackName = '${{ env.STACK_NAME }}';
+            const env       = '${{ matrix.environment }}';
+
+            let outputsTable = '';
+            try {
+              const outputs = JSON.parse(process.env.OUTPUTS_JSON || '[]');
+              if (outputs.length > 0) {
+                const rows = outputs.map(o =>
+                  `| \`${o.OutputKey}\` | \`${o.OutputValue}\` |`
+                ).join('\n');
+                outputsTable = `| Output | Valor |\n|--------|-------|\n${rows}`;
+              } else {
+                outputsTable = '_Sin outputs_';
+              }
+            } catch (_) {
+              outputsTable = '_Error obteniendo outputs_';
+            }
+
+            const body = [
+              `#### CloudFormation Deploy — \`${env}\` ✅`,
+              '',
+              `**Stack:** \`${stackName}\`  `,
+              `**Status:** Desplegado exitosamente`,
+              '',
+              '<details><summary>Stack Outputs</summary>',
+              '',
+              outputsTable,
+              '',
+              '</details>',
+              '',
+              `*Commit: \`${{ github.sha }}\`, Actor: @${{ github.actor }}*`
+            ].join('\n');
+
+            github.rest.repos.createCommitComment({
+              owner:      context.repo.owner,
+              repo:       context.repo.repo,
+              commit_sha: context.sha,
+              body
+            });

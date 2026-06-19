@@ -76,6 +76,7 @@ resource "aws_iam_role_policy" "infrastructure_services" {
   policy = jsonencode({
     Version = "2012-10-17"
     Statement = [
+      { Effect = "Allow", Action = ["cloudformation:*"], Resource = "*" },
       { Effect = "Allow", Action = ["ec2:*"], Resource = "*" },
       { Effect = "Allow", Action = ["rds:*"], Resource = "*" },
       { Effect = "Allow", Action = ["lambda:*"], Resource = "*" },

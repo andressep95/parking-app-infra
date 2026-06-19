@@ -1,0 +1,400 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Cognito User Pool para parking-app — IdP para Spring Boot 3 en VPS Contabo.
+  Equivalente CloudFormation del módulo Terraform en infrastructure/modules/cognito/.
+  Usuarios: máx. 100 concurrentes. Sin triggers Lambda. RBAC via cognito:groups.
+
+# ============================================================
+# Parámetros — diferencias entre dev y prod
+# ============================================================
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Proyecto"
+        Parameters:
+          - ProjectName
+          - Environment
+      - Label:
+          default: "Cognito — Password Policy"
+        Parameters:
+          - PasswordMinimumLength
+      - Label:
+          default: "Cognito — Token Lifetimes"
+        Parameters:
+          - AccessTokenValidityHours
+          - RefreshTokenValidityDays
+    ParameterLabels:
+      ProjectName:
+        default: "Nombre del proyecto (minúsculas y guiones)"
+      Environment:
+        default: "Entorno de despliegue"
+      PasswordMinimumLength:
+        default: "Longitud mínima de contraseña"
+      AccessTokenValidityHours:
+        default: "Validez del access token (horas)"
+      RefreshTokenValidityDays:
+        default: "Validez del refresh token (días)"
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: parking-app
+    Description: Prefijo para identificar los recursos de este proyecto
+    AllowedPattern: "^[a-z0-9][a-z0-9-]{1,30}[a-z0-9]$"
+    ConstraintDescription: "Solo minúsculas, números y guiones. 3-32 caracteres."
+
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues:
+      - dev
+      - prod
+    Description: >
+      Entorno de despliegue. Afecta DeletionProtection:
+      dev = INACTIVE (teardown seguro), prod = ACTIVE.
+
+  PasswordMinimumLength:
+    Type: Number
+    Default: 10
+    MinValue: 8
+    MaxValue: 99
+    Description: "Mínimo 10 para operadores. Evitar símbolos para facilitar teclados de terminales TUU."
+
+  AccessTokenValidityHours:
+    Type: Number
+    Default: 1
+    MinValue: 1
+    MaxValue: 24
+    Description: >
+      1 hora recomendado. El access token es el que valida cada request HTTP
+      en Spring Boot. Más tiempo = mayor ventana si el token es comprometido.
+
+  RefreshTokenValidityDays:
+    Type: Number
+    Default: 30
+    MinValue: 1
+    MaxValue: 365
+    Description: >
+      30 días para terminales TUU con uso diario continuo.
+      Evita re-logins frecuentes en dispositivos físicos de estacionamiento.
+
+# ============================================================
+# Condiciones
+# ============================================================
+Conditions:
+  IsProd: !Equals [!Ref Environment, prod]
+
+# ============================================================
+# Recursos
+# ============================================================
+Resources:
+
+  # ----------------------------------------------------------
+  # Cognito User Pool
+  # ----------------------------------------------------------
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub "${Environment}-${ProjectName}-user-pool"
+
+      # INACTIVE en dev para poder hacer `aws cloudformation delete-stack` sin bloqueos.
+      # ACTIVE en prod previene borrado accidental de usuarios de producción.
+      DeletionProtection: !If [IsProd, ACTIVE, INACTIVE]
+
+      # Username libre = RUT (ej: "76543210-K").
+      # NO se usa email ni phone_number como username — por eso se omite UsernameAttributes.
+      # Esta configuración es inmutable tras la creación del User Pool.
+      UsernameConfiguration:
+        # false = case-insensitive: "76543210k" y "76543210K" son el mismo usuario.
+        # Best practice de AWS: evita duplicados accidentales por capitalización.
+        # Inmutable tras la creación — definir aquí o aceptar el default (true = sensitive).
+        CaseSensitive: false
+
+      # Sin auto-verificación de email/phone — los usuarios los crea un admin,
+      # no se registran solos. La verificación de email es innecesaria en este flujo.
+      # Omitir la propiedad equivale a lista vacía.
+
+      # Solo admins crean usuarios. Apropiado para:
+      #   - ADMIN: lo crea el equipo Haulmer via SDK
+      #   - CUSTOMER: lo crea un ADMIN via SDK
+      #   - OPERATOR: lo crea un CUSTOMER (admin de la org) via SDK
+      # Previene que un tercero se registre con un RUT de operador válido.
+      AdminCreateUserConfig:
+        AllowAdminCreateUserOnly: true
+        # Contraseña temporal expira en 3 días — el operador debe cambiarla
+        # al primer login. Evita cuentas huérfanas con password temporal indefinida.
+        UnusedAccountValidityDays: 3
+
+      # Password policy
+      Policies:
+        PasswordPolicy:
+          MinimumLength: !Ref PasswordMinimumLength
+          RequireLowercase: true
+          RequireUppercase: true
+          RequireNumbers: true
+          # Símbolos desactivados: los terminales TUU tienen teclados físicos
+          # donde ingresar "!@#$" es difícil y genera fricción innecesaria.
+          RequireSymbols: false
+          TemporaryPasswordValidityDays: 3
+
+      # MFA desactivado: 100 usuarios, terminales físicos en estacionamiento.
+      # Activar OPTIONAL cuando la app escale a > 500 MAUs o se detecte riesgo.
+      MfaConfiguration: "OFF"
+
+      # Email via Cognito default. Suficiente para < 50 emails/día (invitaciones,
+      # reset de passwords). Migrar a SES si se supera ese límite o se necesita
+      # dominio personalizado en el remitente.
+      EmailConfiguration:
+        EmailSendingAccount: COGNITO_DEFAULT
+
+      # Recuperación de cuenta vía email. En la práctica el flujo ForgotPassword
+      # no se usa (los admins hacen AdminSetUserPassword), pero se define como
+      # fallback en caso de necesidad.
+      AccountRecoverySetting:
+        RecoveryMechanisms:
+          - Name: verified_email
+            Priority: 1
+
+      # Schema: atributos estándar requeridos + custom attributes.
+      # Nota: los atributos estándar como email/given_name/family_name
+      # se pueden marcar como Required=true desde aquí.
+      # Los custom attributes van con "custom:" prefix automáticamente en Cognito.
+      Schema:
+        # Atributos estándar requeridos
+        - Name: email
+          AttributeDataType: String
+          Required: true
+          Mutable: true
+          StringAttributeConstraints:
+            MinLength: "5"
+            MaxLength: "256"
+
+        - Name: given_name
+          AttributeDataType: String
+          Required: true
+          Mutable: true
+          StringAttributeConstraints:
+            MinLength: "1"
+            MaxLength: "100"
+
+        - Name: family_name
+          AttributeDataType: String
+          Required: true
+          Mutable: true
+          StringAttributeConstraints:
+            MinLength: "1"
+            MaxLength: "100"
+
+        # custom:role — metadata del rol para display en la app.
+        # NO usar para autorización: la autorización se hace con cognito:groups en el JWT.
+        # Solo escribible desde el backend via AWS SDK (AdminUpdateUserAttributes).
+        # El app client tiene este atributo en ReadAttributes pero NO en WriteAttributes.
+        - Name: role
+          AttributeDataType: String
+          Required: false
+          Mutable: true
+          StringAttributeConstraints:
+            MinLength: "1"
+            MaxLength: "50"
+
+        # custom:org_id — UUID de la organización del usuario en PostgreSQL.
+        # No viaja en el JWT (sin Pre-Token Generation trigger).
+        # Spring Boot resuelve el org_id haciendo lookup por users.cognito_sub (índice UNIQUE).
+        - Name: org_id
+          AttributeDataType: String
+          Required: false
+          Mutable: true
+          StringAttributeConstraints:
+            MinLength: "0"
+            MaxLength: "36"
+
+      UserPoolTags:
+        Project: !Ref ProjectName
+        Environment: !Ref Environment
+        ManagedBy: cloudformation
+
+  # ----------------------------------------------------------
+  # App Client — móvil / terminal TUU
+  #
+  # DECISIONES CLAVE:
+  #   GenerateSecret=false  → apps nativas/móviles no pueden proteger un secret
+  #   USER_SRP_AUTH only    → el password NUNCA viaja en texto plano al servidor
+  #   AllowedOAuthFlowsUserPoolClient=false → la app usa SDK directo, no managed login
+  # ----------------------------------------------------------
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: !Sub "${Environment}-${ProjectName}-client"
+      UserPoolId: !Ref UserPool
+
+      # false: apps nativas no pueden proteger un client secret.
+      # IMPORTANTE: este valor es inmutable (Update requires: Replacement).
+      GenerateSecret: false
+
+      # Solo los flujos seguros necesarios:
+      #   ALLOW_USER_SRP_AUTH      → challenge/response, password nunca sale del cliente
+      #   ALLOW_REFRESH_TOKEN_AUTH → renovación de tokens sin re-autenticar
+      # EXCLUIMOS deliberadamente:
+      #   ALLOW_USER_PASSWORD_AUTH → envía password en claro al servidor Cognito
+      #   ALLOW_ADMIN_USER_PASSWORD_AUTH → solo para llamadas desde el backend (usar SDK)
+      ExplicitAuthFlows:
+        - ALLOW_USER_SRP_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+
+      # Solo Cognito como IdP — no Google, Facebook, SAML, etc.
+      SupportedIdentityProviders:
+        - COGNITO
+
+      # Validez de tokens
+      AccessTokenValidity: !Ref AccessTokenValidityHours
+      IdTokenValidity: !Ref AccessTokenValidityHours
+      RefreshTokenValidity: !Ref RefreshTokenValidityDays
+
+      TokenValidityUnits:
+        AccessToken: hours
+        IdToken: hours
+        RefreshToken: days
+
+      # Revocación de refresh tokens: el logout explícito invalida el token en Cognito.
+      # Esto permite implementar "Cerrar sesión" que realmente funciona.
+      # El access token sigue válido hasta expirar (máx 1h) — aceptable para esta escala.
+      # Activado por defecto en nuevos clientes, pero se especifica explícitamente
+      # para que sea visible como decisión de arquitectura.
+      EnableTokenRevocation: true
+
+      # Previene user enumeration: errores de auth no revelan si el usuario existe.
+      # Con LEGACY, un atacante podría listar usuarios válidos probando RUTs.
+      PreventUserExistenceErrors: ENABLED
+
+      # No se usan OAuth 2.0 flows (hosted UI, managed login).
+      # La app móvil/terminal llama directamente al SDK de Cognito.
+      AllowedOAuthFlowsUserPoolClient: false
+
+      # Atributos que el app client puede LEER (del userInfo endpoint o token).
+      # custom:role y custom:org_id son read-only desde el cliente —
+      # el backend los escribe via AdminUpdateUserAttributes con credenciales SDK.
+      ReadAttributes:
+        - email
+        - given_name
+        - family_name
+        - phone_number
+        - custom:role
+        - custom:org_id
+
+      # Atributos que el app client puede ESCRIBIR.
+      # EXCLUIDOS deliberadamente: custom:role y custom:org_id
+      # Solo el backend (con credenciales de admin SDK) puede establecer el rol
+      # y el org_id — nunca el cliente directamente.
+      WriteAttributes:
+        - email
+        - given_name
+        - family_name
+        - phone_number
+
+  # ----------------------------------------------------------
+  # Grupos de roles — RBAC
+  #
+  # Spring Boot lee el claim 'cognito:groups' del access token y lo convierte
+  # en ROLE_ADMIN, ROLE_CUSTOMER, ROLE_OPERATOR via JwtGrantedAuthoritiesConverter.
+  #
+  # Precedencia: menor valor = mayor prioridad cuando un usuario pertenece
+  # a múltiples grupos (afecta cognito:preferred_role en tokens de identity pool).
+  #
+  # IMPORTANTE: GroupName es inmutable (Update requires: Replacement).
+  # Si se necesita renombrar un grupo, se debe crear uno nuevo y migrar usuarios.
+  # ----------------------------------------------------------
+  GroupAdmin:
+    Type: AWS::Cognito::UserPoolGroup
+    Properties:
+      GroupName: ADMIN
+      UserPoolId: !Ref UserPool
+      Description: "Equipo Haulmer — acceso total a todos los customers y locations"
+      Precedence: 0
+
+  GroupCustomer:
+    Type: AWS::Cognito::UserPoolGroup
+    Properties:
+      GroupName: CUSTOMER
+      UserPoolId: !Ref UserPool
+      Description: "Empresa cliente — gestiona sus propias locations y operadores"
+      Precedence: 10
+
+  GroupOperator:
+    Type: AWS::Cognito::UserPoolGroup
+    Properties:
+      GroupName: OPERATOR
+      UserPoolId: !Ref UserPool
+      Description: "Cajero/operador — opera el terminal en una location asignada"
+      Precedence: 20
+
+# ============================================================
+# Outputs — valores para configurar Spring Boot en el VPS
+#
+# Uso:
+#   aws cloudformation describe-stacks \
+#     --stack-name parking-dev-cognito \
+#     --query "Stacks[0].Outputs"
+#
+# Variables de entorno en el VPS:
+#   COGNITO_USER_POOL_ID → UserPoolId output
+#   COGNITO_CLIENT_ID    → ClientId output
+#   SPRING_SECURITY_OAUTH2_RESOURCESERVER_JWT_ISSUER_URI → IssuerUrl output
+# ============================================================
+Outputs:
+  UserPoolId:
+    Description: "ID del User Pool → env var COGNITO_USER_POOL_ID en el VPS"
+    Value: !GetAtt UserPool.UserPoolId
+    Export:
+      Name: !Sub "${AWS::StackName}-UserPoolId"
+
+  UserPoolArn:
+    Description: "ARN del User Pool — útil para políticas IAM del backend"
+    Value: !GetAtt UserPool.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-UserPoolArn"
+
+  ClientId:
+    Description: "App Client ID → env var COGNITO_CLIENT_ID en la app móvil y VPS"
+    Value: !GetAtt UserPoolClient.ClientId
+    Export:
+      Name: !Sub "${AWS::StackName}-ClientId"
+
+  IssuerUrl:
+    Description: >
+      Issuer URL → spring.security.oauth2.resourceserver.jwt.issuer-uri
+      Spring Boot descarga las JWKS automáticamente desde {IssuerUrl}/.well-known/jwks.json
+    Value: !Sub
+      - "https://cognito-idp.${AWS::Region}.amazonaws.com/${PoolId}"
+      - PoolId: !GetAtt UserPool.UserPoolId
+    Export:
+      Name: !Sub "${AWS::StackName}-IssuerUrl"
+
+  JwksUri:
+    Description: >
+      JWKS endpoint — claves públicas RSA para verificar firmas de tokens.
+      Spring Boot lo consume automáticamente desde issuer-uri.
+      Útil para configurar validación manual o herramientas externas.
+    Value: !Sub
+      - "https://cognito-idp.${AWS::Region}.amazonaws.com/${PoolId}/.well-known/jwks.json"
+      - PoolId: !GetAtt UserPool.UserPoolId
+    Export:
+      Name: !Sub "${AWS::StackName}-JwksUri"
+
+  GroupAdmin:
+    Description: "Nombre del grupo ADMIN → claim cognito:groups en el JWT"
+    Value: !Ref GroupAdmin
+    Export:
+      Name: !Sub "${AWS::StackName}-GroupAdmin"
+
+  GroupCustomer:
+    Description: "Nombre del grupo CUSTOMER → claim cognito:groups en el JWT"
+    Value: !Ref GroupCustomer
+    Export:
+      Name: !Sub "${AWS::StackName}-GroupCustomer"
+
+  GroupOperator:
+    Description: "Nombre del grupo OPERATOR → claim cognito:groups en el JWT"
+    Value: !Ref GroupOperator
+    Export:
+      Name: !Sub "${AWS::StackName}-GroupOperator"
