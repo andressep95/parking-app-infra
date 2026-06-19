@@ -232,14 +232,20 @@ Resources:
       # IMPORTANTE: este valor es inmutable (Update requires: Replacement).
       GenerateSecret: false
 
-      # Solo los flujos seguros necesarios:
-      #   ALLOW_USER_SRP_AUTH      → challenge/response, password nunca sale del cliente
-      #   ALLOW_REFRESH_TOKEN_AUTH → renovación de tokens sin re-autenticar
+      # Flujos habilitados:
+      #   ALLOW_ADMIN_USER_PASSWORD_AUTH → Spring Boot llama AdminInitiateAuth via SDK IAM.
+      #                                    El backend intercepta el login para validar
+      #                                    que el usuario opera desde una terminal autorizada
+      #                                    antes de autenticar contra Cognito.
+      #   ALLOW_REFRESH_TOKEN_AUTH       → renovación de tokens sin re-autenticar.
+      #
       # EXCLUIMOS deliberadamente:
-      #   ALLOW_USER_PASSWORD_AUTH → envía password en claro al servidor Cognito
-      #   ALLOW_ADMIN_USER_PASSWORD_AUTH → solo para llamadas desde el backend (usar SDK)
+      #   ALLOW_USER_SRP_AUTH      → permitiría al cliente ir directo a Cognito,
+      #                              saltándose la validación de terminal en el backend.
+      #   ALLOW_USER_PASSWORD_AUTH → flujo sin IAM, envía password al servidor Cognito
+      #                              sin pasar por el backend.
       ExplicitAuthFlows:
-        - ALLOW_USER_SRP_AUTH
+        - ALLOW_ADMIN_USER_PASSWORD_AUTH
         - ALLOW_REFRESH_TOKEN_AUTH
 
       # Solo Cognito como IdP — no Google, Facebook, SAML, etc.
@@ -356,7 +362,7 @@ Outputs:
 
   ClientId:
     Description: "App Client ID → env var COGNITO_CLIENT_ID en la app móvil y VPS"
-    Value: !GetAtt UserPoolClient.ClientId
+    Value: !Ref UserPoolClient
     Export:
       Name: !Sub "${AWS::StackName}-ClientId"
 
