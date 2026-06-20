@@ -1,8 +1,8 @@
 AWSTemplateFormatVersion: "2010-09-09"
 Description: >
-  Cognito User Pool para parking-app — IdP para Spring Boot 3 en VPS Contabo.
-  Equivalente CloudFormation del módulo Terraform en infrastructure/modules/cognito/.
-  Usuarios: máx. 100 concurrentes. Sin triggers Lambda. RBAC via cognito:groups.
+  Cognito User Pool para parking-app — IdP para Spring Boot en VPS Contabo.
+  Dos app clients: POS/backend (ADMIN_USER_PASSWORD_AUTH via IAM) y web dashboard
+  (USER_SRP_AUTH + Authorization Code PKCE via Amplify). RBAC via cognito:groups.
 
 # ============================================================
 # Parámetros — diferencias entre dev y prod
@@ -78,6 +78,23 @@ Parameters:
     Description: >
       30 días para terminales TUU con uso diario continuo.
       Evita re-logins frecuentes en dispositivos físicos de estacionamiento.
+
+# ============================================================
+# Mappings — URLs del frontend por environment
+#
+# Centralizados aquí para evitar pasar parámetros extra en el CI.
+# El cfn-deploy.yml solo necesita pasar Environment y ProjectName.
+# ============================================================
+Mappings:
+  WebClient:
+    dev:
+      # Dev: Amplify local o localhost para desarrollo
+      CallbackUrl: http://localhost:3000/callback
+      LogoutUrl:   http://localhost:3000
+    prod:
+      # Prod: dominio real del dashboard
+      CallbackUrl: https://parking.cloudcentinel.com/callback
+      LogoutUrl:   https://parking.cloudcentinel.com
 
 # ============================================================
 # Condiciones
@@ -296,6 +313,118 @@ Resources:
         - phone_number
 
   # ----------------------------------------------------------
+  # Hosted UI Domain — requerido para el flujo Authorization Code PKCE
+  #
+  # El dominio Cognito expone el Hosted UI en:
+  #   https://{domain}.auth.{region}.amazoncognito.com/login
+  #
+  # Usado por el web client (UserPoolWebClient) para el flujo code + PKCE.
+  # El POS client (UserPoolClient) no lo necesita — usa SDK directo sin Hosted UI.
+  #
+  # IMPORTANTE: Domain es globalmente único en AWS. El stack name incluye el
+  # environment para evitar colisiones entre dev y prod.
+  # ----------------------------------------------------------
+  UserPoolDomain:
+    Type: AWS::Cognito::UserPoolDomain
+    Properties:
+      Domain: !Sub "${Environment}-${ProjectName}"
+      UserPoolId: !Ref UserPool
+
+  # ----------------------------------------------------------
+  # App Client — dashboard web (ADMIN y CUSTOMER)
+  #
+  # DECISIONES CLAVE:
+  #   GenerateSecret=false  → SPA no puede guardar un secret de forma segura
+  #   ALLOW_USER_SRP_AUTH   → Amplify usa SRP por defecto; el password NUNCA
+  #                           viaja en texto plano (challenge-response)
+  #   AllowedOAuthFlows=code → Authorization Code + PKCE para Hosted UI
+  #
+  # Por qué NO tiene ALLOW_ADMIN_USER_PASSWORD_AUTH:
+  #   Ese flujo requiere credenciales IAM de servidor y está reservado para
+  #   el backend (UserPoolClient). Un browser no puede tener credenciales IAM.
+  #
+  # Por qué los ADMIN/CUSTOMER no usan /auth/device:
+  #   Ese endpoint valida terminales físicos y es exclusivo para OPERATOR.
+  #   ADMIN y CUSTOMER se autentican directamente contra Cognito vía Amplify.
+  # ----------------------------------------------------------
+  UserPoolWebClient:
+    Type: AWS::Cognito::UserPoolClient
+    DependsOn: UserPoolDomain
+    Properties:
+      ClientName: !Sub "${Environment}-${ProjectName}-web-client"
+      UserPoolId: !Ref UserPool
+
+      # false: SPAs no pueden proteger un client secret.
+      # IMPORTANTE: inmutable (Update requires: Replacement).
+      GenerateSecret: false
+
+      # Flujos habilitados:
+      #   ALLOW_USER_SRP_AUTH      → Amplify authentica con SRP. El password
+      #                              nunca viaja en claro — usa challenge-response.
+      #   ALLOW_REFRESH_TOKEN_AUTH → renovación silenciosa de tokens en el browser.
+      #
+      # EXCLUIMOS deliberadamente:
+      #   ALLOW_ADMIN_USER_PASSWORD_AUTH → requiere credenciales IAM de servidor,
+      #                                    imposible desde un browser.
+      #   ALLOW_USER_PASSWORD_AUTH       → envía password en texto plano a Cognito,
+      #                                    inseguro para SPA.
+      ExplicitAuthFlows:
+        - ALLOW_USER_SRP_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+
+      SupportedIdentityProviders:
+        - COGNITO
+
+      # Authorization Code + PKCE — estándar OAuth2 para SPAs.
+      # PKCE previene que un atacante que intercepte el `code` lo pueda canjear
+      # sin el `code_verifier` generado en el browser.
+      AllowedOAuthFlowsUserPoolClient: true
+      AllowedOAuthFlows:
+        - code
+      AllowedOAuthScopes:
+        - openid
+        - email
+        - profile
+
+      # URLs resueltas automáticamente desde Mappings según el Environment.
+      # dev  → http://localhost:3000/{callback|}
+      # prod → https://parking.cloudcentinel.com/{callback|}
+      # Amplify redirige aquí tras login/logout exitoso.
+      CallbackURLs:
+        - !FindInMap [WebClient, !Ref Environment, CallbackUrl]
+      LogoutURLs:
+        - !FindInMap [WebClient, !Ref Environment, LogoutUrl]
+
+      # Misma validez que el cliente POS para consistencia.
+      AccessTokenValidity: !Ref AccessTokenValidityHours
+      IdTokenValidity: !Ref AccessTokenValidityHours
+      RefreshTokenValidity: !Ref RefreshTokenValidityDays
+
+      TokenValidityUnits:
+        AccessToken: hours
+        IdToken: hours
+        RefreshToken: days
+
+      EnableTokenRevocation: true
+      PreventUserExistenceErrors: ENABLED
+
+      # Mismos atributos que el POS client — el backend (Spring Boot) no cambia:
+      # sigue validando JWTs independientemente del client que los emitió.
+      ReadAttributes:
+        - email
+        - given_name
+        - family_name
+        - phone_number
+        - custom:role
+        - custom:org_id
+
+      WriteAttributes:
+        - email
+        - given_name
+        - family_name
+        - phone_number
+
+  # ----------------------------------------------------------
   # Grupos de roles — RBAC
   #
   # Spring Boot lee el claim 'cognito:groups' del access token y lo convierte
@@ -401,3 +530,22 @@ Outputs:
     Value: !Ref GroupOperator
     Export:
       Name: !Sub "${AWS::StackName}-GroupOperator"
+
+  WebClientId:
+    Description: >
+      App Client ID del dashboard web → configurar en Amplify como aws_user_pools_web_client_id.
+      Este client usa USER_SRP_AUTH + Authorization Code PKCE.
+      NO usar para el backend Spring Boot (ese usa ClientId).
+    Value: !Ref UserPoolWebClient
+    Export:
+      Name: !Sub "${AWS::StackName}-WebClientId"
+
+  HostedUiBaseUrl:
+    Description: >
+      URL base del Hosted UI de Cognito.
+      Login:    {HostedUiBaseUrl}/login?client_id={WebClientId}&response_type=code&...
+      Logout:   {HostedUiBaseUrl}/logout?client_id={WebClientId}&logout_uri={WebLogoutUrl}
+      Amplify configura estas URLs automáticamente si se usa Auth.federatedSignIn().
+    Value: !Sub "https://${Environment}-${ProjectName}.auth.${AWS::Region}.amazoncognito.com"
+    Export:
+      Name: !Sub "${AWS::StackName}-HostedUiBaseUrl"
